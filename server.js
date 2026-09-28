@@ -60,6 +60,24 @@ db.exec(`
 // filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
 try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
 
+// fields.js에 bizType/bidMethod를 뒤늦게 추가했는데, 이미 저장된 seen_contracts.summary_json은
+// raw_json은 그대로 있으니 API를 다시 부르지 않고도 재계산할 수 있다 — 부팅 시 한 번 채워준다.
+{
+  const staleRows = db.prepare(`SELECT contract_key, filter_id, raw_json, summary_json FROM seen_contracts`).all();
+  const updateSummaryStmt = db.prepare(`UPDATE seen_contracts SET summary_json = ? WHERE contract_key = ? AND filter_id = ?`);
+  const migrateSummariesTx = db.transaction((rows) => {
+    let migrated = 0;
+    for (const r of rows) {
+      if ('bizType' in JSON.parse(r.summary_json)) continue;
+      updateSummaryStmt.run(JSON.stringify(summarize(JSON.parse(r.raw_json))), r.contract_key, r.filter_id);
+      migrated++;
+    }
+    return migrated;
+  });
+  const migratedCount = migrateSummariesTx(staleRows);
+  if (migratedCount) console.log(`summary_json 재계산: ${migratedCount}건`);
+}
+
 function getSetting(key, fallback = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
   return row ? row.value : fallback;
