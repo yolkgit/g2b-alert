@@ -1,8 +1,9 @@
 const https = require('https');
 
 const BASE_URL = 'https://apis.data.go.kr/1230000/ao/CntrctInfoService';
-// 오퍼레이션명이 정확히 확인되지 않아 두 후보를 순서대로 시도한다 (첫 성공 응답을 그대로 사용)
-const OPERATIONS = ['getCntrctInfoListThng', 'getCntrctInfoListThngPPSSrch'];
+// 실제 서비스키로 확인된 오퍼레이션/파라미터(2026-09-28). 날짜는 YYYYMMDDHHMM(12자리) 형식이어야
+// "필수값 입력 에러"가 나지 않는다 (YYYYMMDD 8자리로 보내면 게이트웨이가 HTTP_ERROR로 튕겨낸다).
+const OPERATION = 'getCntrctInfoListThng';
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
@@ -14,60 +15,56 @@ function httpGet(url) {
   });
 }
 
-function buildUrl(operation, serviceKey, { beginDate, endDate, pageNo, numOfRows }) {
+function buildUrl(serviceKey, { beginDate, endDate, pageNo, numOfRows }) {
   const params = new URLSearchParams({
     serviceKey,
     type: 'json',
     numOfRows: String(numOfRows),
     pageNo: String(pageNo),
     inqryDiv: '1',
-    inqryBgnDate: beginDate,
-    inqryEndDate: endDate,
+    inqryBgnDt: `${beginDate}0000`,
+    inqryEndDt: `${endDate}0000`,
   });
-  return `${BASE_URL}/${operation}?${params.toString()}`;
+  return `${BASE_URL}/${OPERATION}?${params.toString()}`;
 }
 
+// 정상 응답은 {response:{header,body}}, 필수값 오류는 {"nkoneps.com.response.ResponseError":{header}},
+// 게이트웨이 오류(잘못된 파라미터명 등)는 {"OpenAPI_ServiceResponse":{cmmMsgHeader}} 로 각각 다른 최상위 키를 쓴다.
 function extractItems(json) {
-  const body = json && json.response && json.response.body;
-  if (!body) return { items: [], totalCount: 0, resultCode: json?.response?.header?.resultCode, resultMsg: json?.response?.header?.resultMsg };
+  if (json.OpenAPI_ServiceResponse) {
+    const h = json.OpenAPI_ServiceResponse.cmmMsgHeader;
+    return { items: [], totalCount: 0, error: `${h.returnReasonCode} ${h.errMsg} ${h.returnAuthMsg}` };
+  }
+  const wrapper = json.response || json['nkoneps.com.response.ResponseError'];
+  const header = wrapper?.header;
+  if (!header) return { items: [], totalCount: 0, error: '알 수 없는 응답 형식' };
+  if (header.resultCode !== '00' && header.resultCode !== '0') {
+    return { items: [], totalCount: 0, error: `${header.resultCode} ${header.resultMsg}` };
+  }
+  const body = wrapper.body || {};
   let items = body.items;
   if (!items) items = [];
   else if (items.item) items = Array.isArray(items.item) ? items.item : [items.item];
   else if (!Array.isArray(items)) items = [items];
-  return { items, totalCount: Number(body.totalCount || items.length), resultCode: json.response.header?.resultCode, resultMsg: json.response.header?.resultMsg };
+  return { items, totalCount: Number(body.totalCount || items.length) };
 }
 
-// 특정 오퍼레이션+날짜범위의 전체 페이지를 안전 한도(MAX_PAGES) 안에서 모두 가져온다
-async function fetchAllPages(operation, serviceKey, beginDate, endDate, { maxPages = 20, numOfRows = 999 } = {}) {
+// 날짜범위의 전체 페이지를 안전 한도(maxPages) 안에서 모두 가져온다
+async function fetchContracts(serviceKey, beginDate, endDate, { maxPages = 20, numOfRows = 999 } = {}) {
   const all = [];
   let truncated = false;
-  let lastMeta = null;
   for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
-    const url = buildUrl(operation, serviceKey, { beginDate, endDate, pageNo, numOfRows });
+    const url = buildUrl(serviceKey, { beginDate, endDate, pageNo, numOfRows });
     const { status, body } = await httpGet(url);
     let json;
     try { json = JSON.parse(body); } catch { throw new Error(`API 응답 파싱 실패 (status=${status}): ${body.slice(0, 300)}`); }
-    const { items, totalCount, resultCode, resultMsg } = extractItems(json);
-    lastMeta = { resultCode, resultMsg, totalCount };
-    if (resultCode && resultCode !== '00' && resultCode !== '0') {
-      return { items: all, meta: lastMeta, error: resultMsg || resultCode };
-    }
+    const { items, totalCount, error } = extractItems(json);
+    if (error) throw new Error(`나라장터 계약정보 API 오류: ${error}`);
     all.push(...items);
     if (all.length >= totalCount || items.length === 0) break;
     if (pageNo === maxPages && all.length < totalCount) truncated = true;
   }
-  return { items: all, meta: lastMeta, truncated };
+  return { items: all, operation: OPERATION, truncated };
 }
 
-// 두 오퍼레이션 후보를 순서대로 시도해서 정상 응답(resultCode 00)을 주는 쪽을 사용한다
-async function fetchContracts(serviceKey, beginDate, endDate, opts) {
-  let lastError = null;
-  for (const operation of OPERATIONS) {
-    const result = await fetchAllPages(operation, serviceKey, beginDate, endDate, opts);
-    if (!result.error) return { ...result, operation };
-    lastError = result.error;
-  }
-  throw new Error(`나라장터 계약정보 API 호출 실패: ${lastError}`);
-}
-
-module.exports = { fetchContracts, BASE_URL, OPERATIONS };
+module.exports = { fetchContracts, BASE_URL, OPERATION };

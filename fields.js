@@ -1,15 +1,12 @@
-// 나라장터 계약정보 API의 실제 응답 필드명이 사전에 100% 확정되지 않아,
-// 로직은 후보 키 목록에서 값을 찾는 방식으로 짜고, 원본 JSON은 항상 별도 보존한다.
-// 실제 첫 응답을 보고 후보가 틀렸으면 이 파일의 후보 배열만 고치면 된다.
+// 실제 서비스키로 확인된 getCntrctInfoListThng 응답 필드명(2026-09-28).
+// dminsttList/corpList는 "[순번^필드^필드^...]" 형태로 패킹된 문자열이라 별도로 풀어서 읽는다.
 const FIELD_CANDIDATES = {
-  contractNo: ['cntrctNo', 'untyCntrctNo', 'cntrctSno'],
-  contractDate: ['cntrctCnclsDate', 'cntrctDate', 'cntrctCnclsDe', 'cntrctDminsttDate'],
-  itemName: ['prdctClsfcNoNm', 'prdctNm', 'bidNtceNm', 'cntrctNm'],
-  detailItemName: ['dtilPrdctClsfcNoNm', 'prdctClsfcNoNm'],
-  demandOrg: ['dmndInsttNm', 'dminsttNm', 'cntrctInsttNm'],
-  company: ['rprsntCorpNm', 'corpNm', 'cmpnyNm'],
-  amount: ['cntrctAmt', 'ttalCntrctAmt', 'cntrctPrdAmt'],
-  region: ['dmndInsttRgnNm', 'rprsntCorpAdrs', 'cntrctInsttRgnNm'],
+  contractNo: ['untyCntrctNo', 'dcsnCntrctNo', 'cntrctRefNo'],
+  contractDate: ['cntrctCnclsDate', 'cntrctDate'],
+  itemName: ['cntrctNm'],
+  detailItemName: ['pubPrcrmntClsfcNm', 'pubPrcrmntMidClsfcNm', 'pubPrcrmntLrgClsfcNm'],
+  amount: ['thtmCntrctAmt', 'totCntrctAmt'],
+  detailUrl: ['cntrctDtlInfoUrl', 'cntrctInfoUrl'],
 };
 
 function pick(item, candidates) {
@@ -20,9 +17,28 @@ function pick(item, candidates) {
   return null;
 }
 
+// "[1^1270315^법무부 대전지방교정청 대전교도소^국가기관^^^][2^...]" 같은 패킹 문자열에서
+// 그룹별로 필드를 쪼갠다. fieldIndex는 각 그룹을 "^"로 split한 배열의 인덱스.
+function parsePackedList(raw, fieldIndex) {
+  if (!raw) return [];
+  const groups = raw.split('][').map((g) => g.replace(/^\[/, '').replace(/\]$/, ''));
+  return groups.map((g) => g.split('^')[fieldIndex]).filter(Boolean);
+}
+
+function demandOrgNames(item) {
+  const names = parsePackedList(item.dminsttList, 2);
+  return names.length ? names.join(', ') : pick(item, ['cntrctInsttNm']);
+}
+function companyNames(item) {
+  const names = parsePackedList(item.corpList, 3);
+  return names.length ? names.join(', ') : null;
+}
+
 function summarize(item) {
   const out = {};
   for (const [field, candidates] of Object.entries(FIELD_CANDIDATES)) out[field] = pick(item, candidates);
+  out.demandOrg = demandOrgNames(item);
+  out.company = companyNames(item);
   return out;
 }
 
