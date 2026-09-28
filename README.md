@@ -43,5 +43,23 @@ cd ~/g2b-alert && git pull && docker compose up -d --build
 
 호스트 포트 **3009** (3004 dhweb·3006 asphalt·3007 factory·3008 jejucar와 겹치지 않게 선택).
 
-웹푸시는 HTTPS(또는 localhost)에서만 동작하므로, `factory.soritok.com`과 같은 패턴으로
-서브도메인 + nginx 리버스 프록시(`proxy_pass http://127.0.0.1:3009`) + certbot 인증서 발급이 필요하다.
+공개 주소: **https://g2b.soritok.com** (`*.soritok.com` 와일드카드 DNS가 이미 서버 IP를 가리키고 있어
+DNS 작업은 불필요, nginx + certbot만 필요). 서버에서 아래를 사용자가 직접 실행(sudo 비밀번호 필요):
+
+```
+sudo tee /etc/nginx/sites-enabled/g2b.soritok.com <<'EOF'
+server {
+    listen 80;
+    server_name g2b.soritok.com;
+    location / {
+        proxy_pass http://127.0.0.1:3009;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+EOF
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d g2b.soritok.com --redirect
+```
