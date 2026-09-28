@@ -15,9 +15,17 @@ function httpGet(url) {
   });
 }
 
+// data.go.kr은 "인증키(Encoding)"와 "인증키(Decoding)" 두 형태를 제공하는데, Encoding 형태를
+// 그대로 붙여넣으면 %3D%3D 같은 퍼센트 인코딩이 문자 그대로 포함돼 있다. URLSearchParams가 이걸
+// 다시 인코딩하면 %가 %25로 이중 인코딩되어 SERVICE_KEY_IS_NOT_REGISTERED_ERROR가 난다.
+// 퍼센트 인코딩처럼 보이면 한 번 미리 디코딩해서 항상 순수 디코딩 형태로 맞춘다.
+function normalizeServiceKey(key) {
+  return /%[0-9A-Fa-f]{2}/.test(key) ? decodeURIComponent(key) : key;
+}
+
 function buildUrl(serviceKey, { beginDate, endDate, pageNo, numOfRows }) {
   const params = new URLSearchParams({
-    serviceKey,
+    serviceKey: normalizeServiceKey(serviceKey),
     type: 'json',
     numOfRows: String(numOfRows),
     pageNo: String(pageNo),
