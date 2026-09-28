@@ -1,0 +1,17 @@
+{
+  "name": "g2b-alert",
+  "version": "1.0.0",
+  "description": "나라장터 특정품목 조달 계약 매일 아침 알림 앱",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "gen-icons": "node scripts/gen-icons.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "express": "^5.2.1",
+    "node-cron": "^3.0.3",
+    "web-push": "^3.6.7"
+  }
+}
