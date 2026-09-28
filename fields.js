@@ -7,6 +7,8 @@ const FIELD_CANDIDATES = {
   detailItemName: ['pubPrcrmntClsfcNm', 'pubPrcrmntMidClsfcNm', 'pubPrcrmntLrgClsfcNm'],
   amount: ['thtmCntrctAmt', 'totCntrctAmt'],
   detailUrl: ['cntrctDtlInfoUrl', 'cntrctInfoUrl'],
+  bizType: ['bsnsDivNm'],
+  bidMethod: ['cntrctCnclsMthdNm'],
 };
 
 function pick(item, candidates) {

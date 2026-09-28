@@ -21,9 +21,9 @@ function chunk(type, data) {
   return Buffer.concat([len, typeBuf, data, crcBuf]);
 }
 
-// 배경(오렌지) + 흰색 알림벨 모양의 정사각형 PWA 아이콘을 순수 zlib으로 생성
+// 배경(나라장터 네이비) + 흰색 알림벨 모양의 정사각형 PWA 아이콘을 순수 zlib으로 생성
 function drawIcon(size) {
-  const bg = [245, 166, 35]; // #f5a623
+  const bg = [28, 63, 110]; // #1c3f6e
   const fg = [255, 255, 255];
   const cx = size / 2, cy = size / 2;
   const bellTop = size * 0.28, bellBottom = size * 0.68, bellWidth = size * 0.34;

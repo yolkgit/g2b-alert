@@ -5,41 +5,46 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>나라장터 특정품목 알림</title>
 <link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#f5a623">
+<meta name="theme-color" content="#1c3f6e">
 <link rel="icon" href="/icons/icon-192.png">
 <style>
-*{box-sizing:border-box;margin:0;font-family:'Segoe UI',system-ui,sans-serif}
-body{background:#0d1117;color:#e6edf3;min-height:100vh}
-.wrap{max-width:640px;margin:0 auto;padding:16px}
-h1{font-size:18px;font-weight:800;margin-bottom:2px}
-.sub{font-size:12px;color:#8b949e;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;margin-bottom:14px}
-.card h2{font-size:14px;font-weight:800;margin-bottom:10px;display:flex;align-items:center;gap:6px}
-label{font-size:12px;color:#8b949e;display:block;margin-bottom:4px}
-input,select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:8px;color:#e6edf3;padding:10px;font-size:14px;outline:none;margin-bottom:8px}
-input:focus{border-color:#f5a623}
-button{background:#f5a623;border:none;border-radius:8px;color:#000;padding:10px 14px;font-size:13px;font-weight:800;cursor:pointer}
-button.secondary{background:#21262d;color:#e6edf3;border:1px solid #30363d}
-button.danger{background:#f04060;color:#fff}
+*{box-sizing:border-box;margin:0;font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif}
+body{background:#eef1f5;color:#222;min-height:100vh}
+.wrap{max-width:960px;margin:0 auto;padding:16px}
+h1{font-size:18px;font-weight:800;color:#1c3f6e;margin-bottom:2px}
+.sub{font-size:12px;color:#666;margin-bottom:16px}
+.card{background:#fff;border:1px solid #d3d9e0;border-radius:4px;padding:16px;margin-bottom:14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.card h2{font-size:14px;font-weight:800;color:#1c3f6e;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid #1c3f6e;display:flex;align-items:center;gap:6px}
+label{font-size:12px;color:#666;display:block;margin-bottom:4px}
+input,select{width:100%;background:#fff;border:1px solid #b8c0cc;border-radius:3px;color:#222;padding:9px 10px;font-size:13px;outline:none;margin-bottom:8px}
+input:focus{border-color:#1c3f6e}
+button{background:#1c3f6e;border:1px solid #1c3f6e;border-radius:3px;color:#fff;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}
+button.secondary{background:#fff;color:#1c3f6e;border:1px solid #1c3f6e}
+button.danger{background:#fff;color:#c0392b;border:1px solid #c0392b}
 button:disabled{opacity:.5;cursor:not-allowed}
 .row{display:flex;gap:8px}
 .row>*{flex:1}
-.pill{display:inline-block;background:#21262d;border:1px solid #30363d;border-radius:999px;padding:2px 10px;font-size:11px;color:#8b949e}
-.pill.ok{color:#3fb950;border-color:#3fb95055}
-.pill.warn{color:#f0a020;border-color:#f0a02055}
-.filter-item,.contract-item{border-top:1px solid #21262d;padding:10px 0;font-size:13px}
-.filter-item:first-child,.contract-item:first-child{border-top:none}
-.filter-item{display:flex;justify-content:space-between;align-items:center}
-.contract-item .title{font-weight:700;margin-bottom:2px}
-.contract-item .meta{color:#8b949e;font-size:12px}
-.tabs{display:flex;gap:6px;overflow-x:auto;margin-bottom:10px;padding-bottom:2px}
-.tabs button{flex:none;background:#21262d;color:#8b949e;border:1px solid #30363d;font-size:12px;padding:6px 12px;white-space:nowrap}
-.tabs button.active{background:#f5a623;color:#000;border-color:#f5a623}
-pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
-.err{color:#f04060;font-size:12px;margin:6px 0}
-.msg{color:#3fb950;font-size:12px;margin:6px 0}
-#login-view{height:100vh;display:flex;align-items:center;justify-content:center}
-.login-box{background:#161b22;border:1px solid #30363d;border-radius:16px;padding:34px 28px;width:320px;text-align:center}
+.pill{display:inline-block;background:#eef1f5;border:1px solid #b8c0cc;border-radius:3px;padding:2px 8px;font-size:11px;color:#555}
+.pill.ok{color:#1a7f37;border-color:#1a7f3755;background:#eaf7ee}
+.pill.warn{color:#c0392b;border-color:#c0392b55;background:#fdeeec}
+.filter-item{border-top:1px solid #e5e8ec;padding:8px 0;font-size:13px;display:flex;justify-content:space-between;align-items:center}
+.filter-item:first-child{border-top:none}
+.tabs{display:flex;gap:4px;overflow-x:auto;margin-bottom:10px;padding-bottom:2px}
+.tabs button{flex:none;background:#f0f3f7;color:#1c3f6e;border:1px solid #b8c0cc;font-size:12px;padding:6px 12px;white-space:nowrap}
+.tabs button.active{background:#1c3f6e;color:#fff;border-color:#1c3f6e}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{background:#1c3f6e;color:#fff;font-weight:700;padding:8px 6px;border:1px solid #16335c;white-space:nowrap;text-align:center}
+tbody td{padding:7px 6px;border:1px solid #dde2e8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+tbody tr:nth-child(even){background:#f7f9fc}
+tbody tr:hover{background:#eaf0fa}
+td.num{text-align:right;color:#1a56b8;font-variant-numeric:tabular-nums}
+td.center{text-align:center}
+.table-scroll{overflow-x:auto}
+pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
+.err{color:#c0392b;font-size:12px;margin:6px 0}
+.msg{color:#1a7f37;font-size:12px;margin:6px 0}
+#login-view{height:100vh;display:flex;align-items:center;justify-content:center;background:#eef1f5}
+.login-box{background:#fff;border:1px solid #d3d9e0;border-radius:4px;padding:34px 28px;width:320px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.08)}
 .login-box .logo{font-size:34px;margin-bottom:6px}
 #main-view{display:none}
 </style>
@@ -107,7 +112,7 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
       <h2>과거 내역 불러오기</h2>
       <div class="sub" id="backfill-sub">아직 실행한 적 없음</div>
       <button class="secondary" onclick="startBackfill()" id="backfill-btn">2026년 전체 내역 불러오기</button>
-      <div class="sub" style="margin-top:6px">한 번 돌리면 API 호출을 많이 써서(구간을 나눠 순차 조회) 몇 분 걸릴 수 있습니다. 알림은 안 가고, 매칭된 것만 저장돼서 아래 탭에서 볼 수 있습니다.</div>
+      <div class="sub" style="margin-top:6px">한 번 돌리면 API 호출을 많이 써서(구간을 나눠 순차 조회) 몇 분 걸릴 수 있습니다. 알림은 안 가고, 매칭된 것만 저장돼서 아래 표에서 볼 수 있습니다.</div>
       <div class="err" id="backfill-err"></div>
     </div>
 
@@ -123,7 +128,7 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
 
       <label>품목 키워드</label>
       <div class="row">
-        <input id="filter-keyword" placeholder="품목 키워드 (예: 고상제설제, 위 검색으로 채우거나 직접 입력)">
+        <input id="filter-keyword" placeholder="품목 키워드 (예: 고상제설제, 위 검색으로 채우거나 직접 입력)" oninput="selectedItemCode=null">
         <input id="filter-region" placeholder="지역 (비워두면 전국 전체 조회)">
       </div>
       <button onclick="addFilter()">필터 추가</button>
@@ -131,9 +136,26 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
     </div>
 
     <div class="card">
-      <h2>최근 알림된 계약</h2>
+      <h2>특정품목 조달 내역</h2>
       <div class="tabs" id="contract-tabs"></div>
-      <div id="contract-list"><div class="sub">아직 없음</div></div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>업무구분</th>
+              <th>계약(납품요구)일자</th>
+              <th>수요기관</th>
+              <th>세부품명번호</th>
+              <th>세부품명</th>
+              <th>업체명</th>
+              <th>낙찰방법</th>
+              <th>계약금액</th>
+            </tr>
+          </thead>
+          <tbody id="contract-tbody"></tbody>
+        </table>
+      </div>
+      <div class="sub" id="contract-empty" style="margin-top:8px">아직 없음</div>
     </div>
   </div>
 </div>
@@ -253,6 +275,8 @@ async function testFetch() {
   } catch (e) { err.textContent = e.message; pre.style.display = 'none'; }
 }
 
+let selectedItemCode = null;
+
 async function searchItems() {
   const keyword = document.getElementById('item-search').value.trim();
   const err = document.getElementById('item-search-err');
@@ -270,7 +294,12 @@ async function searchItems() {
       btn.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px';
       btn.textContent = (it.name || '(이름 없음)') + (it.code ? ` · ${it.code}` : '');
       if (it.desc) btn.title = it.desc;
-      btn.onclick = () => { document.getElementById('filter-keyword').value = it.name || keyword; results.innerHTML = ''; document.getElementById('item-search').value = ''; };
+      btn.onclick = () => {
+        document.getElementById('filter-keyword').value = it.name || keyword;
+        selectedItemCode = it.code || null;
+        results.innerHTML = '';
+        document.getElementById('item-search').value = '';
+      };
       results.appendChild(btn);
     }
   } catch (e) { err.textContent = e.message; results.innerHTML = ''; }
@@ -295,7 +324,7 @@ async function loadFilters() {
   for (const f of filters) {
     const div = document.createElement('div');
     div.className = 'filter-item';
-    div.innerHTML = `<span>${f.keyword}${f.region ? ' · ' + f.region : ''}</span>`;
+    div.innerHTML = `<span>${f.keyword}${f.item_code ? ' (' + f.item_code + ')' : ''}${f.region ? ' · ' + f.region : ''}</span>`;
     const del = document.createElement('button');
     del.className = 'danger'; del.textContent = '삭제';
     del.onclick = async () => { await api(`/api/filters/${f.id}`, { method: 'DELETE' }); loadFilters(); loadContracts(); };
@@ -308,9 +337,10 @@ async function addFilter() {
   const keyword = document.getElementById('filter-keyword').value.trim();
   const region = document.getElementById('filter-region').value.trim();
   if (!keyword) return;
-  await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region }) });
+  await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region, itemCode: selectedItemCode }) });
   document.getElementById('filter-keyword').value = '';
   document.getElementById('filter-region').value = '';
+  selectedItemCode = null;
   loadFilters();
 }
 
@@ -344,18 +374,27 @@ function renderContractTabs() {
 }
 
 function renderContractList() {
-  const list = document.getElementById('contract-list');
+  const tbody = document.getElementById('contract-tbody');
+  const empty = document.getElementById('contract-empty');
   const rows = activeFilterId === 'all' ? allContracts : allContracts.filter((r) => r.filter_id === activeFilterId);
-  list.innerHTML = rows.length ? '' : '<div class="sub">아직 없음</div>';
+  tbody.innerHTML = '';
+  empty.style.display = rows.length ? 'none' : 'block';
   for (const r of rows) {
     const s = r.summary || {};
-    const div = document.createElement('div');
-    div.className = 'contract-item';
-    div.innerHTML = `
-      <div class="title">${s.itemName || '(품목명 미확인)'} <span class="pill">${r.keyword}</span></div>
-      <div class="meta">${s.demandOrg || ''} · ${s.company || ''} · ${s.amount ? Number(s.amount).toLocaleString() + '원' : ''} · ${s.contractDate || ''}</div>
-    `;
-    list.appendChild(div);
+    const tr = document.createElement('tr');
+    const cell = (text, cls) => `<td${cls ? ' class="' + cls + '"' : ''} title="${(text || '').toString().replace(/"/g, '&quot;')}">${text || ''}</td>`;
+    tr.innerHTML =
+      cell(s.bizType || '물품', 'center') +
+      cell(s.contractDate) +
+      cell(s.demandOrg) +
+      cell(r.item_code, 'center') +
+      cell(r.keyword) +
+      cell(s.company) +
+      cell(s.bidMethod, 'center') +
+      cell(s.amount ? Number(s.amount).toLocaleString() + '원' : '', 'num');
+    if (s.detailUrl) tr.style.cursor = 'pointer';
+    if (s.detailUrl) tr.onclick = () => window.open(s.detailUrl, '_blank');
+    tbody.appendChild(tr);
   }
 }
 

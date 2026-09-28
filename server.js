@@ -18,6 +18,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword TEXT NOT NULL,
     region TEXT,
+    item_code TEXT,
     created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -55,6 +56,9 @@ db.exec(`
     PRIMARY KEY (begin_date, end_date, contract_key)
   );
 `);
+
+// filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
+try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
 
 function getSetting(key, fallback = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
@@ -161,10 +165,10 @@ app.get('/api/item-lookup', async (req, res) => {
   }
 });
 app.post('/api/filters', (req, res) => {
-  const { keyword, region } = req.body || {};
+  const { keyword, region, itemCode } = req.body || {};
   if (!keyword || !keyword.trim()) return res.status(400).json({ error: 'keyword 필요' });
-  const info = db.prepare(`INSERT INTO filters (keyword, region, created_at) VALUES (?, ?, ?)`)
-    .run(keyword.trim(), (region || '').trim() || null, new Date().toISOString());
+  const info = db.prepare(`INSERT INTO filters (keyword, region, item_code, created_at) VALUES (?, ?, ?, ?)`)
+    .run(keyword.trim(), (region || '').trim() || null, (itemCode || '').trim() || null, new Date().toISOString());
   res.json({ id: info.lastInsertRowid });
 });
 app.delete('/api/filters/:id', (req, res) => {
@@ -392,7 +396,7 @@ app.get('/api/test-fetch', async (req, res) => {
 app.get('/api/contracts', (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 50, 200);
   const rows = db.prepare(`
-    SELECT sc.contract_key, sc.filter_id, sc.summary_json, sc.matched_keyword, sc.created_at, f.keyword, f.region
+    SELECT sc.contract_key, sc.filter_id, sc.summary_json, sc.matched_keyword, sc.created_at, f.keyword, f.region, f.item_code
     FROM seen_contracts sc JOIN filters f ON f.id = sc.filter_id
     ORDER BY sc.created_at DESC LIMIT ?
   `).all(limit);
