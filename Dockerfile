@@ -7,7 +7,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-COPY g2bClient.js fields.js server.js ./
+COPY *.js ./
 COPY public/ ./public/
 
 VOLUME ["/app/data"]
