@@ -215,6 +215,7 @@ async function searchItems() {
       btn.className = 'secondary';
       btn.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px';
       btn.textContent = (it.name || '(이름 없음)') + (it.code ? ` · ${it.code}` : '');
+      if (it.desc) btn.title = it.desc;
       btn.onclick = () => { document.getElementById('filter-keyword').value = it.name || keyword; results.innerHTML = ''; document.getElementById('item-search').value = ''; };
       results.appendChild(btn);
     }

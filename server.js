@@ -124,8 +124,8 @@ app.get('/api/item-lookup', async (req, res) => {
   const serviceKey = getSetting('g2b_service_key');
   if (!serviceKey) return res.status(400).json({ error: '서비스키가 설정되지 않았습니다' });
   try {
-    const { items, keywordParam } = await searchItemCodes(serviceKey, keyword);
-    res.json({ items: items.map(summarizeItem), keywordParam });
+    const { items } = await searchItemCodes(serviceKey, keyword);
+    res.json({ items: items.map(summarizeItem) });
   } catch (err) {
     const hint = err.message.includes('SERVICE_KEY_IS_NOT_REGISTERED') ? ' (data.go.kr에서 "조달청_물품목록정보서비스" 활용신청이 별도로 필요합니다)' : '';
     res.status(500).json({ error: err.message + hint });

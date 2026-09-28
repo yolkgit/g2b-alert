@@ -1,10 +1,10 @@
 const https = require('https');
 
-const BASE_URL = 'https://apis.data.go.kr/1230000/ao/ThngListInfoService';
-// 세부물품분류번호(10자리 = 세부품명) 목록/검색 오퍼레이션. 파라미터명은 실제 서비스키 승인 전이라
-// 미확정 — prdctClsfcNoNm(품명)을 우선 시도하고 안 되면 dtilPrdctClsfcNoNm으로 재시도한다.
-const OPERATION = 'getPrdctClsfcNoUnit10Info';
-const KEYWORD_PARAM_CANDIDATES = ['prdctClsfcNoNm', 'dtilPrdctClsfcNoNm'];
+// 실제 서비스키로 확인된 값(2026-09-28, 참고문서 "조달청_OpenAPI참고자료_물품목록정보서비스_1.2.docx"):
+// 서비스명/오퍼레이션명 모두 "02"가 붙는다(v1 이름으로 호출하면 NO_OPENAPI_SERVICE_ERROR).
+// dtilPrdctClsfcNoNm(세부품명)은 Like 검색이라 "제설제"처럼 일부만 넣어도 고상제설제/액상제설제 등이 다 걸린다.
+const BASE_URL = 'https://apis.data.go.kr/1230000/ao/ThngListInfoService02';
+const OPERATION = 'getPrdctClsfcNoUnit10Info02';
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
@@ -16,13 +16,13 @@ function httpGet(url) {
   });
 }
 
-function buildUrl(serviceKey, keywordParam, keyword) {
+function buildUrl(serviceKey, keyword) {
   const params = new URLSearchParams({
     serviceKey,
     type: 'json',
     numOfRows: '30',
     pageNo: '1',
-    [keywordParam]: keyword,
+    dtilPrdctClsfcNoNm: keyword,
   });
   return `${BASE_URL}/${OPERATION}?${params.toString()}`;
 }
@@ -46,36 +46,22 @@ function parseResponse(json) {
   return { items };
 }
 
-// 파라미터명 후보를 순서대로 시도해서 정상 응답(에러 없음)을 주는 쪽을 쓴다
 async function searchItemCodes(serviceKey, keyword) {
-  let lastError = null;
-  for (const keywordParam of KEYWORD_PARAM_CANDIDATES) {
-    const url = buildUrl(serviceKey, keywordParam, keyword);
-    const { body } = await httpGet(url);
-    let json;
-    try { json = JSON.parse(body); } catch { lastError = `응답 파싱 실패: ${body.slice(0, 200)}`; continue; }
-    const { items, error } = parseResponse(json);
-    if (!error) return { items, keywordParam };
-    lastError = error;
-  }
-  throw new Error(`물품목록 검색 API 오류: ${lastError}`);
-}
-
-// 응답 필드명도 미확정이라 후보 키 중 값이 있는 걸 골라 화면에 보여줄 이름/코드를 구성한다.
-// 후보가 틀렸으면 이 배열만 고치면 되고, 원본 item은 그대로 함께 내려가니 화면에서 원본도 볼 수 있다.
-const NAME_CANDIDATES = ['dtilPrdctClsfcNoNm', 'prdctClsfcNoNm', 'prdctNm'];
-const CODE_CANDIDATES = ['dtilPrdctClsfcNo', 'prdctClsfcNo'];
-
-function pick(item, candidates) {
-  for (const key of candidates) {
-    const v = item[key];
-    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
-  }
-  return null;
+  const { body } = await httpGet(buildUrl(serviceKey, keyword));
+  let json;
+  try { json = JSON.parse(body); } catch { throw new Error(`응답 파싱 실패: ${body.slice(0, 200)}`); }
+  const { items, error } = parseResponse(json);
+  if (error) throw new Error(`물품목록 검색 API 오류: ${error}`);
+  return { items };
 }
 
 function summarizeItem(item) {
-  return { name: pick(item, NAME_CANDIDATES), code: pick(item, CODE_CANDIDATES), raw: item };
+  return {
+    name: item.dtilPrdctClsfcNoNm || null,
+    code: item.dtilPrdctClsfcNo || null,
+    desc: item.dtilPrdctClsfcNoNmDscrpt || null,
+    raw: item,
+  };
 }
 
 module.exports = { searchItemCodes, summarizeItem, BASE_URL, OPERATION };
