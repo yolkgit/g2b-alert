@@ -114,6 +114,16 @@ app.post('/api/settings/service-key', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/settings/password', (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: '현재 비밀번호와 새 비밀번호를 모두 입력하세요' });
+  if (currentPassword !== getPassword()) return res.status(401).json({ error: '현재 비밀번호가 틀렸습니다' });
+  if (newPassword.length < 4) return res.status(400).json({ error: '새 비밀번호는 4자 이상이어야 합니다' });
+  setSetting('password', newPassword);
+  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(getAuthToken(newPassword))}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+  res.json({ ok: true });
+});
+
 app.get('/api/filters', (req, res) => {
   res.json(db.prepare(`SELECT * FROM filters ORDER BY id DESC`).all());
 });
