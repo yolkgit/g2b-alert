@@ -1,4 +1,5 @@
 const https = require('https');
+const { normalizeServiceKey } = require('./serviceKey');
 
 // 실제 서비스키로 확인된 값(2026-09-28, 참고문서 "조달청_OpenAPI참고자료_물품목록정보서비스_1.2.docx"):
 // 서비스명/오퍼레이션명 모두 "02"가 붙는다(v1 이름으로 호출하면 NO_OPENAPI_SERVICE_ERROR).
@@ -18,7 +19,7 @@ function httpGet(url) {
 
 function buildUrl(serviceKey, keyword) {
   const params = new URLSearchParams({
-    serviceKey,
+    serviceKey: normalizeServiceKey(serviceKey),
     type: 'json',
     numOfRows: '30',
     pageNo: '1',
