@@ -73,6 +73,14 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
     </div>
 
     <div class="card">
+      <h2>과거 내역 불러오기</h2>
+      <div class="sub" id="backfill-sub">아직 실행한 적 없음</div>
+      <button class="secondary" onclick="startBackfill()" id="backfill-btn">2026년 전체 내역 불러오기</button>
+      <div class="sub" style="margin-top:6px">한 번 돌리면 API 호출을 많이 써서(구간을 나눠 순차 조회) 몇 분 걸릴 수 있습니다. 알림은 안 가고, 매칭된 것만 저장돼서 아래 탭에서 볼 수 있습니다.</div>
+      <div class="err" id="backfill-err"></div>
+    </div>
+
+    <div class="card">
       <h2>data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
       <label>공공데이터포털에서 발급받은 "나라장터 계약정보서비스" 인증키(Decoding)</label>
       <input type="password" id="service-key" placeholder="서비스키 입력">
@@ -136,7 +144,31 @@ async function loadSettings() {
   document.getElementById('last-run-sub').textContent = s.lastRunAt
     ? `마지막 조회: ${new Date(s.lastRunAt).toLocaleString('ko-KR')} · ${s.lastRunSummary || ''}`
     : '아직 조회 기록 없음 (매일 오전 7시 자동 실행)';
+  if (s.lastBackfillAt) {
+    document.getElementById('backfill-sub').textContent = `마지막 실행: ${new Date(s.lastBackfillAt).toLocaleString('ko-KR')} · ${s.lastBackfillSummary || ''}`;
+  }
   window.__vapidKey = s.vapidPublicKey;
+}
+
+async function startBackfill() {
+  const btn = document.getElementById('backfill-btn');
+  const sub = document.getElementById('backfill-sub');
+  const err = document.getElementById('backfill-err');
+  err.textContent = '';
+  try {
+    await api('/api/backfill', { method: 'POST', body: JSON.stringify({ fromDate: '20260101' }) });
+  } catch (e) { err.textContent = e.message; return; }
+  btn.disabled = true; btn.textContent = '불러오는 중...';
+  const poll = setInterval(async () => {
+    const st = await api('/api/backfill/status');
+    sub.textContent = st.progress || '';
+    if (st.status === 'done' || st.status === 'error') {
+      clearInterval(poll);
+      btn.disabled = false; btn.textContent = '2026년 전체 내역 불러오기';
+      if (st.error) err.textContent = st.error;
+      await loadSettings(); await loadContracts();
+    }
+  }, 2000);
 }
 
 async function saveServiceKey() {

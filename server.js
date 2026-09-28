@@ -102,6 +102,8 @@ app.get('/api/settings', (req, res) => {
     vapidPublicKey: getSetting('vapid_public'),
     lastRunAt: getSetting('last_run_at'),
     lastRunSummary: getSetting('last_run_summary'),
+    lastBackfillAt: getSetting('last_backfill_at'),
+    lastBackfillSummary: getSetting('last_backfill_summary'),
   });
 });
 app.post('/api/settings/service-key', (req, res) => {
@@ -164,6 +166,31 @@ function fmtDate(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
+const insertSeenStmt = db.prepare(`INSERT INTO seen_contracts
+    (contract_key, filter_id, raw_json, summary_json, matched_keyword, created_at)
+    VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(contract_key, filter_id) DO NOTHING`);
+const alreadySeenStmt = db.prepare(`SELECT 1 FROM seen_contracts WHERE contract_key = ? AND filter_id = ?`);
+
+// items를 filters에 매칭시켜 처음 보는 것만 seen_contracts에 저장하고, 필터별 신규 매칭 목록을 돌려준다
+function matchAndStore(items, filters) {
+  const newByFilter = new Map();
+  for (const item of items) {
+    const key = buildContractKey(item);
+    for (const filter of filters) {
+      const kwMatch = itemMatchesKeyword(item, filter.keyword);
+      const rgMatch = !filter.region || itemMatchesKeyword(item, filter.region);
+      if (!kwMatch || !rgMatch) continue;
+      if (alreadySeenStmt.get(key, filter.id)) continue;
+
+      const summary = summarize(item);
+      insertSeenStmt.run(key, filter.id, JSON.stringify(item), JSON.stringify(summary), filter.keyword, new Date().toISOString());
+      if (!newByFilter.has(filter.id)) newByFilter.set(filter.id, { filter, items: [] });
+      newByFilter.get(filter.id).items.push(summary);
+    }
+  }
+  return newByFilter;
+}
+
 async function runDailyCheck({ daysBack = 1 } = {}) {
   const serviceKey = getSetting('g2b_service_key');
   if (!serviceKey) return { error: '서비스키가 설정되지 않았습니다' };
@@ -173,28 +200,8 @@ async function runDailyCheck({ daysBack = 1 } = {}) {
   const beginDate = fmtDate(begin), endDate = fmtDate(end);
 
   const { items, operation, truncated, meta } = await fetchContracts(serviceKey, beginDate, endDate);
-
   const filters = db.prepare(`SELECT * FROM filters`).all();
-  const insertSeen = db.prepare(`INSERT INTO seen_contracts
-      (contract_key, filter_id, raw_json, summary_json, matched_keyword, created_at)
-      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(contract_key, filter_id) DO NOTHING`);
-  const alreadySeen = db.prepare(`SELECT 1 FROM seen_contracts WHERE contract_key = ? AND filter_id = ?`);
-
-  const newByFilter = new Map();
-  for (const item of items) {
-    const key = buildContractKey(item);
-    for (const filter of filters) {
-      const kwMatch = itemMatchesKeyword(item, filter.keyword);
-      const rgMatch = !filter.region || itemMatchesKeyword(item, filter.region);
-      if (!kwMatch || !rgMatch) continue;
-      if (alreadySeen.get(key, filter.id)) continue;
-
-      const summary = summarize(item);
-      insertSeen.run(key, filter.id, JSON.stringify(item), JSON.stringify(summary), filter.keyword, new Date().toISOString());
-      if (!newByFilter.has(filter.id)) newByFilter.set(filter.id, { filter, items: [] });
-      newByFilter.get(filter.id).items.push(summary);
-    }
-  }
+  const newByFilter = matchAndStore(items, filters);
 
   for (const { filter, items: matched } of newByFilter.values()) {
     const top = matched.slice(0, 3).map((m) => `${m.itemName || '품목명 미확인'} / ${m.demandOrg || '기관 미확인'}`).join('\n');
@@ -212,6 +219,49 @@ async function runDailyCheck({ daysBack = 1 } = {}) {
   return { beginDate, endDate, operation, totalFetched: items.length, truncated, meta, newByFilter: Object.fromEntries([...newByFilter].map(([k, v]) => [k, v.items])) };
 }
 
+// 하루 단위로 잘라서 훑는 과거 내역 일괄 조회(알림 없음, 필터에 매칭되는 것만 저장). 결과를 바로 쓰지
+// 않고 백그라운드로 돌리는 이유: 몇 달치를 훑으면 API 호출이 수백 번이라 리버스 프록시 타임아웃을 넘긴다.
+let backfillState = { status: 'idle', progress: '', error: null };
+
+async function runBackfillJob(fromDate, toDate) {
+  const serviceKey = getSetting('g2b_service_key');
+  if (!serviceKey) { backfillState = { status: 'error', progress: '', error: '서비스키가 설정되지 않았습니다' }; return; }
+  const filters = db.prepare(`SELECT * FROM filters`).all();
+  if (!filters.length) { backfillState = { status: 'error', progress: '', error: '등록된 필터가 없습니다' }; return; }
+
+  const chunkMs = 7 * 86400000;
+  const from = new Date(`${fromDate.slice(0, 4)}-${fromDate.slice(4, 6)}-${fromDate.slice(6, 8)}T00:00:00Z`);
+  const to = new Date(`${toDate.slice(0, 4)}-${toDate.slice(4, 6)}-${toDate.slice(6, 8)}T00:00:00Z`);
+  const chunks = [];
+  for (let t = from.getTime(); t < to.getTime(); t += chunkMs) {
+    chunks.push([new Date(t), new Date(Math.min(t + chunkMs, to.getTime()))]);
+  }
+
+  let totalFetched = 0;
+  let totalMatched = 0;
+  let truncatedAny = false;
+  for (let i = 0; i < chunks.length; i++) {
+    const [begin, end] = chunks[i];
+    const beginDate = fmtDate(begin), endDate = fmtDate(end);
+    backfillState = { status: 'running', progress: `${i + 1}/${chunks.length} 구간 조회 중 (${beginDate}~${endDate}), 지금까지 원본 ${totalFetched}건 · 매칭 ${totalMatched}건`, error: null };
+    try {
+      const { items, truncated } = await fetchContracts(serviceKey, beginDate, endDate);
+      totalFetched += items.length;
+      if (truncated) truncatedAny = true;
+      const newByFilter = matchAndStore(items, filters);
+      for (const { items: matched } of newByFilter.values()) totalMatched += matched.length;
+    } catch (err) {
+      backfillState = { status: 'error', progress: backfillState.progress, error: err.message };
+      return;
+    }
+  }
+
+  const summaryText = `${fromDate}~${toDate} 전체 조회, 원본 ${totalFetched}건 중 매칭 ${totalMatched}건${truncatedAny ? ' (일부 구간 최대 페이지 초과로 일부 생략됨)' : ''}`;
+  setSetting('last_backfill_at', new Date().toISOString());
+  setSetting('last_backfill_summary', summaryText);
+  backfillState = { status: 'done', progress: summaryText, error: null };
+}
+
 app.post('/api/check-now', async (req, res) => {
   try {
     const result = await runDailyCheck({ daysBack: Number(req.body?.daysBack) || 1 });
@@ -221,6 +271,17 @@ app.post('/api/check-now', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.post('/api/backfill', (req, res) => {
+  if (backfillState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
+  const fromDate = req.body?.fromDate || '20260101';
+  const toDate = req.body?.toDate || fmtDate(new Date());
+  backfillState = { status: 'running', progress: '시작 중...', error: null };
+  runBackfillJob(fromDate, toDate).catch((err) => { backfillState = { status: 'error', progress: '', error: err.message }; });
+  res.json({ started: true, fromDate, toDate });
+});
+
+app.get('/api/backfill/status', (req, res) => res.json(backfillState));
 
 // 실제 API 응답 구조를 필드명 확정 없이 그대로 확인하기 위한 원본 미리보기
 app.get('/api/test-fetch', async (req, res) => {
