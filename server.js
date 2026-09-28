@@ -5,6 +5,7 @@ const cron = require('node-cron');
 const webpush = require('web-push');
 
 const { fetchContracts } = require('./g2bClient');
+const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
 const { summarize, itemMatchesKeyword, buildContractKey } = require('./fields');
 
 const app = express();
@@ -115,6 +116,20 @@ app.post('/api/settings/service-key', (req, res) => {
 
 app.get('/api/filters', (req, res) => {
   res.json(db.prepare(`SELECT * FROM filters ORDER BY id DESC`).all());
+});
+
+app.get('/api/item-lookup', async (req, res) => {
+  const keyword = (req.query.keyword || '').trim();
+  if (!keyword) return res.status(400).json({ error: '검색어가 필요합니다' });
+  const serviceKey = getSetting('g2b_service_key');
+  if (!serviceKey) return res.status(400).json({ error: '서비스키가 설정되지 않았습니다' });
+  try {
+    const { items, keywordParam } = await searchItemCodes(serviceKey, keyword);
+    res.json({ items: items.map(summarizeItem), keywordParam });
+  } catch (err) {
+    const hint = err.message.includes('SERVICE_KEY_IS_NOT_REGISTERED') ? ' (data.go.kr에서 "조달청_물품목록정보서비스" 활용신청이 별도로 필요합니다)' : '';
+    res.status(500).json({ error: err.message + hint });
+  }
 });
 app.post('/api/filters', (req, res) => {
   const { keyword, region } = req.body || {};

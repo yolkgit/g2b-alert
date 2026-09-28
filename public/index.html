@@ -94,9 +94,18 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
 
     <div class="card">
       <h2>알림 받을 품목/지역 필터</h2>
+      <label>품목 검색으로 정확한 품명 찾기 (선택)</label>
       <div class="row">
-        <input id="filter-keyword" placeholder="품목 키워드 (예: 고상제설제)">
-        <input id="filter-region" placeholder="지역 (선택, 예: 강원)">
+        <input id="item-search" placeholder="검색어 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
+        <button class="secondary" style="flex:none" onclick="searchItems()">검색</button>
+      </div>
+      <div id="item-search-err" class="err"></div>
+      <div id="item-search-results" style="margin-bottom:8px"></div>
+
+      <label>품목 키워드</label>
+      <div class="row">
+        <input id="filter-keyword" placeholder="품목 키워드 (예: 고상제설제, 위 검색으로 채우거나 직접 입력)">
+        <input id="filter-region" placeholder="지역 (비워두면 전국 전체 조회)">
       </div>
       <button onclick="addFilter()">필터 추가</button>
       <div id="filter-list" style="margin-top:10px"></div>
@@ -188,6 +197,28 @@ async function testFetch() {
     const data = await api('/api/test-fetch?days=3');
     pre.textContent = JSON.stringify(data, null, 2);
   } catch (e) { err.textContent = e.message; pre.style.display = 'none'; }
+}
+
+async function searchItems() {
+  const keyword = document.getElementById('item-search').value.trim();
+  const err = document.getElementById('item-search-err');
+  const results = document.getElementById('item-search-results');
+  err.textContent = ''; results.innerHTML = '';
+  if (!keyword) return;
+  results.innerHTML = '<div class="sub">검색 중...</div>';
+  try {
+    const data = await api(`/api/item-lookup?keyword=${encodeURIComponent(keyword)}`);
+    results.innerHTML = '';
+    if (!data.items.length) { results.innerHTML = '<div class="sub">검색 결과 없음</div>'; return; }
+    for (const it of data.items) {
+      const btn = document.createElement('button');
+      btn.className = 'secondary';
+      btn.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px';
+      btn.textContent = (it.name || '(이름 없음)') + (it.code ? ` · ${it.code}` : '');
+      btn.onclick = () => { document.getElementById('filter-keyword').value = it.name || keyword; results.innerHTML = ''; document.getElementById('item-search').value = ''; };
+      results.appendChild(btn);
+    }
+  } catch (e) { err.textContent = e.message; results.innerHTML = ''; }
 }
 
 async function checkNow() {
