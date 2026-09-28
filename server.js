@@ -49,6 +49,10 @@ function setSetting(key, value) {
 const ENV_PASSWORD = process.env.APP_PASSWORD || 'g2balert2026';
 if (!getSetting('password')) setSetting('password', ENV_PASSWORD);
 
+if (process.env.G2B_SERVICE_KEY && !getSetting('g2b_service_key')) {
+  setSetting('g2b_service_key', process.env.G2B_SERVICE_KEY);
+}
+
 if (!getSetting('vapid_public')) {
   const keys = webpush.generateVAPIDKeys();
   setSetting('vapid_public', keys.publicKey);
