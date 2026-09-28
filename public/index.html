@@ -32,6 +32,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .filter-item{display:flex;justify-content:space-between;align-items:center}
 .contract-item .title{font-weight:700;margin-bottom:2px}
 .contract-item .meta{color:#8b949e;font-size:12px}
+.tabs{display:flex;gap:6px;overflow-x:auto;margin-bottom:10px;padding-bottom:2px}
+.tabs button{flex:none;background:#21262d;color:#8b949e;border:1px solid #30363d;font-size:12px;padding:6px 12px;white-space:nowrap}
+.tabs button.active{background:#f5a623;color:#000;border-color:#f5a623}
 pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
 .err{color:#f04060;font-size:12px;margin:6px 0}
 .msg{color:#3fb950;font-size:12px;margin:6px 0}
@@ -93,6 +96,7 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
 
     <div class="card">
       <h2>최근 알림된 계약</h2>
+      <div class="tabs" id="contract-tabs"></div>
       <div id="contract-list"><div class="sub">아직 없음</div></div>
     </div>
   </div>
@@ -176,7 +180,7 @@ async function loadFilters() {
     div.innerHTML = `<span>${f.keyword}${f.region ? ' · ' + f.region : ''}</span>`;
     const del = document.createElement('button');
     del.className = 'danger'; del.textContent = '삭제';
-    del.onclick = async () => { await api(`/api/filters/${f.id}`, { method: 'DELETE' }); loadFilters(); };
+    del.onclick = async () => { await api(`/api/filters/${f.id}`, { method: 'DELETE' }); loadFilters(); loadContracts(); };
     div.appendChild(del);
     list.appendChild(div);
   }
@@ -192,9 +196,38 @@ async function addFilter() {
   loadFilters();
 }
 
+let allContracts = [];
+let activeFilterId = 'all';
+
 async function loadContracts() {
-  const rows = await api('/api/contracts?limit=50');
+  allContracts = await api('/api/contracts?limit=200');
+  renderContractTabs();
+  renderContractList();
+}
+
+function renderContractTabs() {
+  const tabs = document.getElementById('contract-tabs');
+  const byFilter = new Map();
+  for (const r of allContracts) {
+    if (!byFilter.has(r.filter_id)) byFilter.set(r.filter_id, { label: r.keyword + (r.region ? ' · ' + r.region : ''), count: 0 });
+    byFilter.get(r.filter_id).count++;
+  }
+  if (!byFilter.has(activeFilterId) && activeFilterId !== 'all') activeFilterId = 'all';
+  tabs.innerHTML = '';
+  const makeTab = (id, label) => {
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.className = id === activeFilterId ? 'active' : '';
+    btn.onclick = () => { activeFilterId = id; renderContractTabs(); renderContractList(); };
+    tabs.appendChild(btn);
+  };
+  makeTab('all', `전체 (${allContracts.length})`);
+  for (const [id, info] of byFilter) makeTab(id, `${info.label} (${info.count})`);
+}
+
+function renderContractList() {
   const list = document.getElementById('contract-list');
+  const rows = activeFilterId === 'all' ? allContracts : allContracts.filter((r) => r.filter_id === activeFilterId);
   list.innerHTML = rows.length ? '' : '<div class="sub">아직 없음</div>';
   for (const r of rows) {
     const s = r.summary || {};

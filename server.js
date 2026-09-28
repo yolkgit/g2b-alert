@@ -240,7 +240,7 @@ app.get('/api/test-fetch', async (req, res) => {
 app.get('/api/contracts', (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 50, 200);
   const rows = db.prepare(`
-    SELECT sc.contract_key, sc.summary_json, sc.matched_keyword, sc.created_at, f.keyword, f.region
+    SELECT sc.contract_key, sc.filter_id, sc.summary_json, sc.matched_keyword, sc.created_at, f.keyword, f.region
     FROM seen_contracts sc JOIN filters f ON f.id = sc.filter_id
     ORDER BY sc.created_at DESC LIMIT ?
   `).all(limit);
