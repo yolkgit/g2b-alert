@@ -66,7 +66,15 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;f
     <div class="sub" id="last-run-sub">불러오는 중...</div>
 
     <div class="card" id="settings-panel" style="display:none">
-      <h2>data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
+      <h2>매일 알림 시간</h2>
+      <div class="row">
+        <input type="time" id="alarm-time">
+        <button style="flex:none" onclick="saveAlarmTime()">저장</button>
+      </div>
+      <div class="err" id="alarm-time-err"></div>
+      <div class="msg" id="alarm-time-msg"></div>
+
+      <h2 style="margin-top:16px">data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
       <label>공공데이터포털에서 발급받은 "나라장터 계약정보서비스" 인증키(Decoding)</label>
       <input type="password" id="service-key" placeholder="서비스키 입력">
       <div class="row">
@@ -163,16 +171,29 @@ async function loadSettings() {
   pill.className = 'pill ' + (s.hasServiceKey ? 'ok' : 'warn');
   document.getElementById('last-run-sub').textContent = s.lastRunAt
     ? `마지막 조회: ${new Date(s.lastRunAt).toLocaleString('ko-KR')} · ${s.lastRunSummary || ''}`
-    : '아직 조회 기록 없음 (매일 오전 7시 자동 실행)';
+    : `아직 조회 기록 없음 (매일 ${s.alarmTime} 자동 실행)`;
   if (s.lastBackfillAt) {
     document.getElementById('backfill-sub').textContent = `마지막 실행: ${new Date(s.lastBackfillAt).toLocaleString('ko-KR')} · ${s.lastBackfillSummary || ''}`;
   }
+  document.getElementById('alarm-time').value = s.alarmTime || '07:00';
   window.__vapidKey = s.vapidPublicKey;
 }
 
 function toggleSettings() {
   const el = document.getElementById('settings-panel');
   el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+async function saveAlarmTime() {
+  const time = document.getElementById('alarm-time').value;
+  const err = document.getElementById('alarm-time-err'), msg = document.getElementById('alarm-time-msg');
+  err.textContent = ''; msg.textContent = '';
+  if (!time) { err.textContent = '시간을 선택하세요'; return; }
+  try {
+    await api('/api/settings/alarm-time', { method: 'POST', body: JSON.stringify({ time }) });
+    msg.textContent = `저장됨 (매일 ${time}에 자동 조회)`;
+    await loadSettings();
+  } catch (e) { err.textContent = e.message; }
 }
 
 async function changePassword() {

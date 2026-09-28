@@ -36,6 +36,24 @@ db.exec(`
     created_at TEXT NOT NULL,
     PRIMARY KEY (contract_key, filter_id)
   );
+  CREATE TABLE IF NOT EXISTS raw_contracts (
+    contract_key TEXT PRIMARY KEY,
+    raw_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS fetch_log (
+    begin_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    item_count INTEGER NOT NULL,
+    PRIMARY KEY (begin_date, end_date)
+  );
+  CREATE TABLE IF NOT EXISTS fetch_items (
+    begin_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    contract_key TEXT NOT NULL,
+    PRIMARY KEY (begin_date, end_date, contract_key)
+  );
 `);
 
 function getSetting(key, fallback = null) {
@@ -105,6 +123,7 @@ app.get('/api/settings', (req, res) => {
     lastRunSummary: getSetting('last_run_summary'),
     lastBackfillAt: getSetting('last_backfill_at'),
     lastBackfillSummary: getSetting('last_backfill_summary'),
+    alarmTime: getSetting('alarm_time', '07:00'),
   });
 });
 app.post('/api/settings/service-key', (req, res) => {
@@ -191,6 +210,46 @@ function fmtDate(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
+const insertRawStmt = db.prepare(`INSERT INTO raw_contracts (contract_key, raw_json, fetched_at)
+    VALUES (?, ?, ?) ON CONFLICT(contract_key) DO NOTHING`);
+const insertFetchItemStmt = db.prepare(`INSERT INTO fetch_items (begin_date, end_date, contract_key)
+    VALUES (?, ?, ?) ON CONFLICT(begin_date, end_date, contract_key) DO NOTHING`);
+const upsertFetchLogStmt = db.prepare(`INSERT INTO fetch_log (begin_date, end_date, fetched_at, item_count)
+    VALUES (?, ?, ?, ?) ON CONFLICT(begin_date, end_date) DO UPDATE SET fetched_at = excluded.fetched_at, item_count = excluded.item_count`);
+const getFetchLogStmt = db.prepare(`SELECT 1 FROM fetch_log WHERE begin_date = ? AND end_date = ?`);
+const getCachedRawStmt = db.prepare(`
+  SELECT rc.raw_json FROM fetch_items fi JOIN raw_contracts rc ON rc.contract_key = fi.contract_key
+  WHERE fi.begin_date = ? AND fi.end_date = ?
+`);
+const cacheRawTx = db.transaction((beginDate, endDate, items) => {
+  const now = new Date().toISOString();
+  for (const item of items) {
+    const key = buildContractKey(item);
+    insertRawStmt.run(key, JSON.stringify(item), now);
+    insertFetchItemStmt.run(beginDate, endDate, key);
+  }
+});
+
+// beginDate~endDate가 이미(완전히 지난 기간으로) API에서 받아온 적 있으면 캐시에서 그대로 돌려주고,
+// 없으면 API를 호출해서 캐시에 저장한다. 오늘을 포함하는 구간은 계속 바뀔 수 있어 캐시하지 않고
+// 항상 새로 부른다. 캐시 재생 시 항목의 계약일자로 다시 걸러내지 않는다 — cntrctCnclsDate/cntrctDate가
+// 실제 조회 기준(계약 변경 이력 등)과 다른 경우가 있어 그렇게 하면 항목이 누락된다(실측 확인함).
+// 대신 fetch_items로 "이 구간을 조회했을 때 실제로 돌아온 항목"을 그대로 기록해서 재생한다.
+async function getOrFetchChunk(serviceKey, beginDate, endDate) {
+  const today = fmtDate(new Date());
+  const cacheable = endDate < today;
+  if (cacheable && getFetchLogStmt.get(beginDate, endDate)) {
+    const rows = getCachedRawStmt.all(beginDate, endDate);
+    return { items: rows.map((r) => JSON.parse(r.raw_json)), truncated: false, fromCache: true };
+  }
+  const result = await fetchContracts(serviceKey, beginDate, endDate);
+  if (cacheable) {
+    cacheRawTx(beginDate, endDate, result.items);
+    upsertFetchLogStmt.run(beginDate, endDate, new Date().toISOString(), result.items.length);
+  }
+  return { ...result, fromCache: false };
+}
+
 const insertSeenStmt = db.prepare(`INSERT INTO seen_contracts
     (contract_key, filter_id, raw_json, summary_json, matched_keyword, created_at)
     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(contract_key, filter_id) DO NOTHING`);
@@ -265,12 +324,14 @@ async function runBackfillJob(fromDate, toDate) {
   let totalFetched = 0;
   let totalMatched = 0;
   let truncatedAny = false;
+  let cachedChunks = 0;
   for (let i = 0; i < chunks.length; i++) {
     const [begin, end] = chunks[i];
     const beginDate = fmtDate(begin), endDate = fmtDate(end);
-    backfillState = { status: 'running', progress: `${i + 1}/${chunks.length} 구간 조회 중 (${beginDate}~${endDate}), 지금까지 원본 ${totalFetched}건 · 매칭 ${totalMatched}건`, error: null };
+    backfillState = { status: 'running', progress: `${i + 1}/${chunks.length} 구간 조회 중 (${beginDate}~${endDate}), 지금까지 원본 ${totalFetched}건 · 매칭 ${totalMatched}건 (캐시 ${cachedChunks}구간 재사용)`, error: null };
     try {
-      const { items, truncated } = await fetchContracts(serviceKey, beginDate, endDate);
+      const { items, truncated, fromCache } = await getOrFetchChunk(serviceKey, beginDate, endDate);
+      if (fromCache) cachedChunks++;
       totalFetched += items.length;
       if (truncated) truncatedAny = true;
       const newByFilter = matchAndStore(items, filters);
@@ -281,7 +342,7 @@ async function runBackfillJob(fromDate, toDate) {
     }
   }
 
-  const summaryText = `${fromDate}~${toDate} 전체 조회, 원본 ${totalFetched}건 중 매칭 ${totalMatched}건${truncatedAny ? ' (일부 구간 최대 페이지 초과로 일부 생략됨)' : ''}`;
+  const summaryText = `${fromDate}~${toDate} 전체 조회, 원본 ${totalFetched}건 중 매칭 ${totalMatched}건 (캐시 재사용 ${cachedChunks}/${chunks.length}구간)${truncatedAny ? ' (일부 구간 최대 페이지 초과로 일부 생략됨)' : ''}`;
   setSetting('last_backfill_at', new Date().toISOString());
   setSetting('last_backfill_summary', summaryText);
   backfillState = { status: 'done', progress: summaryText, error: null };
@@ -335,9 +396,23 @@ app.get('/api/contracts', (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-cron.schedule('0 7 * * *', () => {
-  runDailyCheck({ daysBack: 1 }).catch((err) => console.error('daily check failed:', err.message));
-}, { timezone: 'Asia/Seoul' });
+let dailyTask = null;
+function scheduleDailyCheck(time) {
+  if (dailyTask) dailyTask.stop();
+  const [hh, mm] = time.split(':').map(Number);
+  dailyTask = cron.schedule(`${mm} ${hh} * * *`, () => {
+    runDailyCheck({ daysBack: 1 }).catch((err) => console.error('daily check failed:', err.message));
+  }, { timezone: 'Asia/Seoul' });
+}
+scheduleDailyCheck(getSetting('alarm_time', '07:00'));
+
+app.post('/api/settings/alarm-time', (req, res) => {
+  const { time } = req.body || {};
+  if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(time || '')) return res.status(400).json({ error: '시간 형식이 올바르지 않습니다 (HH:MM)' });
+  setSetting('alarm_time', time);
+  scheduleDailyCheck(time);
+  res.json({ ok: true });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));
