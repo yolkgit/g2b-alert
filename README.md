@@ -43,7 +43,7 @@ node server.js
 cd ~/g2b-alert && git pull && docker compose up -d --build
 ```
 
-호스트 포트 **3009** (3004 dhweb·3006 asphalt·3007 factory·3008 jejucar와 겹치지 않게 선택).
+호스트 포트 **3008** (jejucar가 폐상돼 비었음 확인 후 사용. 3004 dhweb·3006 asphalt·3007 factory·3009 ipdf와는 겹치지 않음).
 
 공개 주소: **https://g2b.soritok.com** (`*.soritok.com` 와일드카드 DNS가 이미 서버 IP를 가리키고 있어
 DNS 작업은 불필요, nginx + certbot만 필요). 서버에서 아래를 사용자가 직접 실행(sudo 비밀번호 필요):
@@ -54,7 +54,7 @@ server {
     listen 80;
     server_name g2b.soritok.com;
     location / {
-        proxy_pass http://127.0.0.1:3009;
+        proxy_pass http://127.0.0.1:3008;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

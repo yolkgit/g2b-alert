@@ -4,7 +4,7 @@ services:
     container_name: g2b-alert
     restart: unless-stopped
     ports:
-      - "3009:3000"
+      - "3008:3000"
     volumes:
       - ./data:/app/data
     environment:
