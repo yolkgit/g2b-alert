@@ -337,7 +337,12 @@ async function runBackfillJob(fromDate, toDate) {
       const newByFilter = matchAndStore(items, filters);
       for (const { items: matched } of newByFilter.values()) totalMatched += matched.length;
     } catch (err) {
-      backfillState = { status: 'error', progress: backfillState.progress, error: err.message };
+      // 중간에 실패해도 여기까지 처리한 구간은 이미 매칭·저장됐으니(캐시된 구간은 다음 번에 이어서
+      // 재사용됨) 진행 상황을 남겨서 "얼마나 됐었는지"가 사라지지 않게 한다.
+      const partialSummary = `${fromDate}~${toDate} 조회 중 ${i}/${chunks.length}구간에서 중단(${beginDate}~${endDate} 실패), 그때까지 원본 ${totalFetched}건 중 매칭 ${totalMatched}건 (캐시 재사용 ${cachedChunks}구간) — ${err.message}`;
+      setSetting('last_backfill_at', new Date().toISOString());
+      setSetting('last_backfill_summary', partialSummary);
+      backfillState = { status: 'error', progress: partialSummary, error: err.message };
       return;
     }
   }
