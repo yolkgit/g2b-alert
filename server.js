@@ -492,6 +492,29 @@ function runHubScrape(code, fromDate, toDate) {
   });
 }
 
+// 번호가 비어 있는 필터를 키워드로 조회해 채운다. 이름이 정확히 일치하는 세부품명이 하나일
+// 때만 채우고, 애매하면(여러 개거나 못 찾으면) 건드리지 않는다 — 엉뚱한 품목을 수집하면 안 되므로.
+async function fillMissingItemCodes() {
+  const serviceKey = getSetting('g2b_service_key');
+  if (!serviceKey) return;
+  const pending = db.prepare(`SELECT * FROM filters WHERE item_code IS NULL OR item_code = ''`).all();
+  const update = db.prepare(`UPDATE filters SET item_code = ? WHERE id = ?`);
+  for (const f of pending) {
+    try {
+      const { items } = await searchItemCodes(serviceKey, f.keyword);
+      const exact = items.filter((it) => (it.dtilPrdctClsfcNoNm || '').trim() === f.keyword.trim());
+      if (exact.length === 1) {
+        update.run(exact[0].dtilPrdctClsfcNo, f.id);
+        console.log(`[hub] 세부품명번호 자동 등록: ${f.keyword} → ${exact[0].dtilPrdctClsfcNo}`);
+      } else {
+        console.log(`[hub] ${f.keyword}: 정확히 일치하는 세부품명 ${exact.length}건 — 건너뜀`);
+      }
+    } catch (e) {
+      console.error(`[hub] ${f.keyword} 품목 조회 실패:`, e.message);
+    }
+  }
+}
+
 // 등록된 필터 중 세부품명번호가 있는 것만 수집한다(번호가 없으면 허브 조회가 불가능).
 // 기간을 안 주면 최근 7일치를 본다 — 오늘 하루만 보면 아직 계약이 안 올라와 0건이 되기 쉽다.
 async function runHubScrapeAll({ fromDate, toDate } = {}) {
@@ -501,9 +524,13 @@ async function runHubScrapeAll({ fromDate, toDate } = {}) {
     fromDate = fmtDate(begin);
     toDate = fmtDate(end);
   }
+  // item_code 컬럼이 생기기 전에 만든 필터는 번호가 비어 있다. 키워드로 물품목록 API를 조회해
+  // 이름이 정확히 일치하는 세부품명이 있으면 자동으로 채운다(사용자가 다시 등록할 필요 없게).
+  await fillMissingItemCodes();
+
   const filters = db.prepare(`SELECT * FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all();
   if (!filters.length) {
-    hubState = { status: 'error', progress: '', error: '세부품명번호가 등록된 필터가 없습니다 (품목 검색으로 필터를 추가하세요)' };
+    hubState = { status: 'error', progress: '', error: '세부품명번호를 확인할 수 없습니다. 필터의 품목명이 정확한지(예: 고상제설제) 확인하거나, 품목 검색으로 다시 추가해 주세요.' };
     return;
   }
   const done = [];

@@ -339,11 +339,13 @@ async function checkNow() {
   finally { btn.disabled = false; btn.textContent = '지금 계약 조회'; }
 }
 
+let allFilters = [];
+
 async function loadFilters() {
-  const filters = await api('/api/filters');
+  allFilters = await api('/api/filters');
   const list = document.getElementById('filter-list');
-  list.innerHTML = filters.length ? '' : '<div class="sub">등록된 필터 없음</div>';
-  for (const f of filters) {
+  list.innerHTML = allFilters.length ? '' : '<div class="sub">등록된 필터 없음</div>';
+  for (const f of allFilters) {
     const div = document.createElement('div');
     div.className = 'filter-item';
     div.innerHTML = `<span>${f.keyword}${f.item_code ? ' (' + f.item_code + ')' : ''}${f.region ? ' · ' + f.region : ''}</span>`;
@@ -363,7 +365,8 @@ async function addFilter() {
   document.getElementById('filter-keyword').value = '';
   document.getElementById('filter-region').value = '';
   selectedItemCode = null;
-  loadFilters();
+  await loadFilters();
+  renderContractTabs();
 }
 
 let allContracts = [];
@@ -382,14 +385,13 @@ async function loadContracts() {
   renderContractList();
 }
 
+// 탭은 등록된 필터 전체를 기준으로 만든다(allContracts만 보면, 허브 수집만 하고 아직
+// 알림 매칭이 없는 필터는 탭 자체가 안 생기는 문제가 있었다). 건수는 허브 자료가 있으면
+// 그쪽을, 없으면 알림 매칭 건수를 보여준다.
 function renderContractTabs() {
   const tabs = document.getElementById('contract-tabs');
-  const byFilter = new Map();
-  for (const r of allContracts) {
-    if (!byFilter.has(r.filter_id)) byFilter.set(r.filter_id, { label: r.keyword + (r.region ? ' · ' + r.region : ''), count: 0 });
-    byFilter.get(r.filter_id).count++;
-  }
-  if (!byFilter.has(activeFilterId) && activeFilterId !== 'all') activeFilterId = 'all';
+  const validIds = new Set(allFilters.map((f) => f.id));
+  if (!validIds.has(activeFilterId) && activeFilterId !== 'all') activeFilterId = 'all';
   tabs.innerHTML = '';
   const makeTab = (id, label) => {
     const btn = document.createElement('button');
@@ -398,8 +400,13 @@ function renderContractTabs() {
     btn.onclick = () => { activeFilterId = id; renderContractTabs(); renderContractList(); };
     tabs.appendChild(btn);
   };
-  makeTab('all', `전체 (${allContracts.length})`);
-  for (const [id, info] of byFilter) makeTab(id, `${info.label} (${info.count})`);
+  const totalCount = hubItems.length || allContracts.length;
+  makeTab('all', `전체 (${totalCount})`);
+  for (const f of allFilters) {
+    const hubCount = f.item_code ? hubItems.filter((h) => h['세부품명번호'] === f.item_code).length : 0;
+    const count = hubCount || allContracts.filter((r) => r.filter_id === f.id).length;
+    makeTab(f.id, `${f.keyword}${f.region ? ' · ' + f.region : ''} (${count})`);
+  }
 }
 
 const cellHtml = (text, cls) =>
@@ -413,8 +420,8 @@ function setHeader(cols) {
 // 선택된 탭의 세부품명번호에 해당하는 허브 데이터가 있으면 그걸(단가·수량 포함) 우선 보여준다.
 function activeItemCode() {
   if (activeFilterId === 'all') return null;
-  const row = allContracts.find((r) => r.filter_id === activeFilterId);
-  return row ? row.item_code : null;
+  const f = allFilters.find((x) => x.id === activeFilterId);
+  return f ? f.item_code : null;
 }
 
 function renderContractList() {
