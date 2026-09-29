@@ -136,22 +136,12 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
     </div>
 
     <div class="card">
-      <h2>특정품목 조달 내역</h2>
+      <h2>특정품목 조달 내역 <span class="pill" id="hub-pill" style="display:none"></span></h2>
       <div class="tabs" id="contract-tabs"></div>
+      <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
       <div class="table-scroll">
         <table>
-          <thead>
-            <tr>
-              <th>업무구분</th>
-              <th>계약(납품요구)일자</th>
-              <th>수요기관</th>
-              <th>세부품명번호</th>
-              <th>세부품명</th>
-              <th>업체명</th>
-              <th>낙찰방법</th>
-              <th>계약금액</th>
-            </tr>
-          </thead>
+          <thead><tr id="contract-thead"></tr></thead>
           <tbody id="contract-tbody"></tbody>
         </table>
       </div>
@@ -346,9 +336,16 @@ async function addFilter() {
 
 let allContracts = [];
 let activeFilterId = 'all';
+let hubItems = [];   // 조달데이터허브에서 긁어온 라인아이템(단가·수량·단위 포함)
+
+// 오픈API 계약 데이터와 허브 라인아이템은 컬럼 구성이 달라서 표 헤더를 각각 정의한다.
+const API_COLS = ['업무구분', '계약(납품요구)일자', '수요기관', '세부품명번호', '세부품명', '업체명', '낙찰방법', '계약금액'];
+const HUB_COLS = ['조달방식', '업무구분', '계약구분', '계약(납품요구)일자', '수요기관', '수요기관소재시군구',
+  '세부품명번호', '세부품명', '품목명', '업체명', '낙찰방법', '단위', '계약납품단가', '계약납품수량', '공급금액'];
 
 async function loadContracts() {
   allContracts = await api('/api/contracts?limit=200');
+  hubItems = await api('/api/hub-items?limit=500').catch(() => []);
   renderContractTabs();
   renderContractList();
 }
@@ -373,27 +370,63 @@ function renderContractTabs() {
   for (const [id, info] of byFilter) makeTab(id, `${info.label} (${info.count})`);
 }
 
+const cellHtml = (text, cls) =>
+  `<td${cls ? ' class="' + cls + '"' : ''} title="${(text ?? '').toString().replace(/"/g, '&quot;')}">${text ?? ''}</td>`;
+const isNumCol = (name) => /단가|수량|금액/.test(name);
+
+function setHeader(cols) {
+  document.getElementById('contract-thead').innerHTML = cols.map((c) => `<th>${c}</th>`).join('');
+}
+
+// 선택된 탭의 세부품명번호에 해당하는 허브 데이터가 있으면 그걸(단가·수량 포함) 우선 보여준다.
+function activeItemCode() {
+  if (activeFilterId === 'all') return null;
+  const row = allContracts.find((r) => r.filter_id === activeFilterId);
+  return row ? row.item_code : null;
+}
+
 function renderContractList() {
   const tbody = document.getElementById('contract-tbody');
   const empty = document.getElementById('contract-empty');
-  const rows = activeFilterId === 'all' ? allContracts : allContracts.filter((r) => r.filter_id === activeFilterId);
+  const pill = document.getElementById('hub-pill');
+  const note = document.getElementById('hub-note');
   tbody.innerHTML = '';
+
+  const code = activeItemCode();
+  const hubRows = code ? hubItems.filter((h) => h['세부품명번호'] === code) : hubItems;
+
+  if (hubRows.length) {
+    setHeader(HUB_COLS);
+    pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
+    note.style.display = ''; note.textContent = `조달데이터허브 자료 ${hubRows.length}건 (npm run scrape-hub 으로 수집)`;
+    empty.style.display = 'none';
+    for (const h of hubRows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = HUB_COLS.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
+      tbody.appendChild(tr);
+    }
+    return;
+  }
+
+  // 허브 자료가 없으면 오픈API 기반 계약 목록을 보여준다(단가·수량 없음)
+  setHeader(API_COLS);
+  pill.style.display = 'none';
+  note.style.display = 'none';
+  const rows = activeFilterId === 'all' ? allContracts : allContracts.filter((r) => r.filter_id === activeFilterId);
   empty.style.display = rows.length ? 'none' : 'block';
   for (const r of rows) {
     const s = r.summary || {};
     const tr = document.createElement('tr');
-    const cell = (text, cls) => `<td${cls ? ' class="' + cls + '"' : ''} title="${(text || '').toString().replace(/"/g, '&quot;')}">${text || ''}</td>`;
     tr.innerHTML =
-      cell(s.bizType || '물품', 'center') +
-      cell(s.contractDate) +
-      cell(s.demandOrg) +
-      cell(r.item_code, 'center') +
-      cell(r.keyword) +
-      cell(s.company) +
-      cell(s.bidMethod, 'center') +
-      cell(s.amount ? Number(s.amount).toLocaleString() + '원' : '', 'num');
-    if (s.detailUrl) tr.style.cursor = 'pointer';
-    if (s.detailUrl) tr.onclick = () => window.open(s.detailUrl, '_blank');
+      cellHtml(s.bizType || '물품', 'center') +
+      cellHtml(s.contractDate) +
+      cellHtml(s.demandOrg) +
+      cellHtml(r.item_code, 'center') +
+      cellHtml(r.keyword) +
+      cellHtml(s.company) +
+      cellHtml(s.bidMethod, 'center') +
+      cellHtml(s.amount ? Number(s.amount).toLocaleString() + '원' : '', 'num');
+    if (s.detailUrl) { tr.style.cursor = 'pointer'; tr.onclick = () => window.open(s.detailUrl, '_blank'); }
     tbody.appendChild(tr);
   }
 }

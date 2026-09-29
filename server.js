@@ -55,6 +55,19 @@ db.exec(`
     contract_key TEXT NOT NULL,
     PRIMARY KEY (begin_date, end_date, contract_key)
   );
+  -- 조달데이터허브 보고서에서 긁어온 라인아이템(단가·수량·단위 포함).
+  -- 오픈API에는 없는 값들이라 scripts/scrape-hub.js가 따로 채운다.
+  CREATE TABLE IF NOT EXISTS hub_items (
+    contract_no TEXT NOT NULL,   -- 계약(납품요구)번호
+    chg_seq TEXT NOT NULL,       -- 변경차수
+    item_seq TEXT NOT NULL,      -- 물품순번
+    item_code TEXT,              -- 세부품명번호
+    contract_date TEXT,          -- 계약(납품요구)일자 YYYYMMDD
+    raw_json TEXT NOT NULL,      -- 49개 컬럼 원본
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (contract_no, chg_seq, item_seq)
+  );
+  CREATE INDEX IF NOT EXISTS idx_hub_items_code_date ON hub_items (item_code, contract_date);
 `);
 
 // filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
@@ -419,6 +432,16 @@ app.get('/api/contracts', (req, res) => {
     ORDER BY sc.created_at DESC LIMIT ?
   `).all(limit);
   res.json(rows.map((r) => ({ ...r, summary: JSON.parse(r.summary_json), summary_json: undefined })));
+});
+
+// 조달데이터허브에서 긁어온 라인아이템. 필터 키워드(=세부품명)나 코드로 좁혀서 본다.
+app.get('/api/hub-items', (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const code = (req.query.code || '').trim();
+  const rows = code
+    ? db.prepare(`SELECT raw_json FROM hub_items WHERE item_code = ? ORDER BY contract_date DESC LIMIT ?`).all(code, limit)
+    : db.prepare(`SELECT raw_json FROM hub_items ORDER BY contract_date DESC LIMIT ?`).all(limit);
+  res.json(rows.map((r) => JSON.parse(r.raw_json)));
 });
 
 app.use(express.static(path.join(__dirname, 'public')));

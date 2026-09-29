@@ -78,6 +78,34 @@ async function setCalendarRange(page, frame, fromYmd, toYmd) {
   await page.waitForTimeout(1500);
 }
 
+// 긁은 라인아이템을 앱 DB(hub_items)에 넣는다. 앱이 이 표를 화면에 그린다.
+// DB_PATH 환경변수로 대상 지정 가능(기본: 프로젝트의 data.db).
+function saveToDb(rows) {
+  let Database;
+  try { Database = require('better-sqlite3'); } catch { console.log('   [DB] better-sqlite3 없음 — 건너뜀'); return; }
+  const dbPath = process.env.DB_PATH || require('path').join(__dirname, '..', 'data.db');
+  const db = new Database(dbPath);
+  db.exec(`CREATE TABLE IF NOT EXISTS hub_items (
+    contract_no TEXT NOT NULL, chg_seq TEXT NOT NULL, item_seq TEXT NOT NULL,
+    item_code TEXT, contract_date TEXT, raw_json TEXT NOT NULL, fetched_at TEXT NOT NULL,
+    PRIMARY KEY (contract_no, chg_seq, item_seq))`);
+  const up = db.prepare(`INSERT INTO hub_items
+    (contract_no, chg_seq, item_seq, item_code, contract_date, raw_json, fetched_at)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(contract_no, chg_seq, item_seq) DO UPDATE SET
+      raw_json = excluded.raw_json, fetched_at = excluded.fetched_at`);
+  const now = new Date().toISOString();
+  const tx = db.transaction((list) => {
+    for (const r of list) {
+      up.run(r['계약(납품요구)번호'] || '', r['변경차수'] || '', r['물품순번'] || '',
+        r['세부품명번호'] || null, r['계약(납품요구)일자'] || null, JSON.stringify(r), now);
+    }
+  });
+  tx(rows);
+  console.log(`   [DB] hub_items 저장 ${rows.length}건 → ${dbPath}`);
+  db.close();
+}
+
 // "안내 메시지" 같은 검증 팝업이 떠 있으면 내용을 읽고 닫는다.
 async function dismissDialog(page, frame) {
   const msg = await frame.evaluate(() => {
@@ -248,6 +276,7 @@ function formFrame(target) {
     fs.writeFileSync('hub-result.csv',
       '﻿' + [parsed.header.map(esc).join(','), ...parsed.data.map((r) => r.map(esc).join(','))].join('\r\n'));
     log('   저장: hub-result.json / hub-result.csv');
+    saveToDb(rowsObj);
   }
 
   try { fs.writeFileSync('hub-result.html', await scope.content()); } catch {}
