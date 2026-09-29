@@ -9,6 +9,11 @@
 //   - 검색폼은 팝업의 메인 프레임, 결과는 iframe[name=mstrFrame](MicroStrategy).
 //   - 조회물품 드롭다운 mf_popupCnts_comp4.5 (WebSquare selectbox, 기본 "물품분류")
 //   - 그 옆 입력칸 mf_popupCnts_comp5, 날짜 wq_uuid_157_ibxStrDay/ibxEndDay, 검색 mf_popupCnts_btnS0001
+//
+// 수집 경로는 두 가지다:
+//   1) CSV 내보내기(기본) — 전체 결과를 받는다. 버튼을 누르면 새 창이 뜨고 거기서 "내보내기"를
+//      한 번 더 눌러야 파일이 떨어진다. 받은 파일은 이름만 .csv 이고 실제로는 UTF-16LE + 탭 구분.
+//   2) 화면 표 파싱(대체) — 페이지당 100건이 상한이라 기간을 쪼개 여러 번 조회한다.
 const fs = require('fs');
 const { chromium } = require('playwright');
 
@@ -211,6 +216,19 @@ async function dismissDialog(page, frame) {
 
 function fmt(d) { return `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`; }
 
+// 도커(alpine)에서는 이미지에 설치된 chromium을 쓰고(CHROMIUM_PATH), 로컬에서는
+// playwright가 받아둔 브라우저를 그대로 쓴다. 컨테이너는 root로 돌아서 sandbox를 끈다.
+function launchOpts() {
+  const opts = { args: ['--no-sandbox', '--disable-dev-shm-usage'] };
+  // alpine 버전에 따라 chromium 실행파일 이름이 chromium-browser / chromium 으로 갈린다.
+  // 지정된 경로가 없으면 나머지 후보를 찾아본다(경로가 틀리면 기능 전체가 죽으므로).
+  const candidates = [process.env.CHROMIUM_PATH, '/usr/bin/chromium-browser', '/usr/bin/chromium'].filter(Boolean);
+  const found = candidates.find((p) => fs.existsSync(p));
+  if (found) opts.executablePath = found;
+  else if (process.env.CHROMIUM_PATH) console.log('   [경고] CHROMIUM_PATH를 찾지 못해 기본 브라우저로 시도합니다');
+  return opts;
+}
+
 async function shot(page, name) {
   if (!SHOT) return;
   try { await page.screenshot({ path: `hub-${name}.png` }); log(`   [shot] hub-${name}.png`); } catch {}
@@ -321,7 +339,7 @@ function formFrame(target) {
   const dFrom = from || today, dTo = to || today;
   log(`조회: 세부품명번호=${code}, 기간=${dFrom}~${dTo}`);
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, ...launchOpts() });
   const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: 'ko-KR', acceptDownloads: true });
 
   log('\n1. 보고서 팝업 열기...');

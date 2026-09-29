@@ -2,6 +2,7 @@ const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
 const cron = require('node-cron');
+const { spawn } = require('child_process');
 const webpush = require('web-push');
 
 const { fetchContracts } = require('./g2bClient');
@@ -159,6 +160,8 @@ app.get('/api/settings', (req, res) => {
     lastBackfillAt: getSetting('last_backfill_at'),
     lastBackfillSummary: getSetting('last_backfill_summary'),
     alarmTime: getSetting('alarm_time', '07:00'),
+    lastHubAt: getSetting('last_hub_at'),
+    lastHubSummary: getSetting('last_hub_summary'),
   });
 });
 app.post('/api/settings/service-key', (req, res) => {
@@ -461,8 +464,82 @@ app.post('/api/settings/alarm-time', (req, res) => {
   if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(time || '')) return res.status(400).json({ error: '시간 형식이 올바르지 않습니다 (HH:MM)' });
   setSetting('alarm_time', time);
   scheduleDailyCheck(time);
+  scheduleHubScrape(time);
   res.json({ ok: true });
 });
+
+// ─── 조달데이터허브 수집(단가·수량·단위) ──────────────────────
+// 헤드리스 브라우저를 띄우는 무거운 작업이라 서버 프로세스와 분리해 자식 프로세스로 돌린다.
+// 브라우저가 죽더라도 앱 본체는 영향받지 않는다.
+let hubState = { status: 'idle', progress: '', error: null };
+
+function runHubScrape(code, fromDate, toDate) {
+  return new Promise((resolve) => {
+    const args = [path.join(__dirname, 'scripts', 'scrape-hub.js'), code];
+    if (fromDate && toDate) args.push(fromDate, toDate);
+    const child = spawn(process.execPath, args, {
+      cwd: __dirname,
+      env: { ...process.env, HUB_SHOTS: '0' }, // 서버에선 스크린샷 생략
+    });
+    let tail = '';
+    const keep = (buf) => { tail = (tail + buf.toString()).slice(-2000); };
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+    child.on('close', (exitCode) => {
+      const m = tail.match(/중복 제거 후 (\d+)건/);
+      resolve({ exitCode, count: m ? Number(m[1]) : null, tail });
+    });
+  });
+}
+
+// 등록된 필터 중 세부품명번호가 있는 것만 수집한다(번호가 없으면 허브 조회가 불가능).
+// 기간을 안 주면 최근 7일치를 본다 — 오늘 하루만 보면 아직 계약이 안 올라와 0건이 되기 쉽다.
+async function runHubScrapeAll({ fromDate, toDate } = {}) {
+  if (!fromDate || !toDate) {
+    const end = new Date();
+    const begin = new Date(end.getTime() - 7 * 86400000);
+    fromDate = fmtDate(begin);
+    toDate = fmtDate(end);
+  }
+  const filters = db.prepare(`SELECT * FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all();
+  if (!filters.length) {
+    hubState = { status: 'error', progress: '', error: '세부품명번호가 등록된 필터가 없습니다 (품목 검색으로 필터를 추가하세요)' };
+    return;
+  }
+  const done = [];
+  for (let i = 0; i < filters.length; i++) {
+    const f = filters[i];
+    hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) 수집 중...`, error: null };
+    const r = await runHubScrape(f.item_code, fromDate, toDate);
+    done.push(`${f.keyword} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`);
+    if (r.exitCode !== 0) console.error(`[hub] ${f.keyword} 실패:\n${r.tail.slice(-600)}`);
+  }
+  const summary = `${new Date().toLocaleString('ko-KR')} · ${done.join(', ')}`;
+  setSetting('last_hub_at', new Date().toISOString());
+  setSetting('last_hub_summary', summary);
+  hubState = { status: 'done', progress: summary, error: null };
+}
+
+app.post('/api/hub-scrape', (req, res) => {
+  if (hubState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
+  const { fromDate, toDate } = req.body || {};
+  hubState = { status: 'running', progress: '시작 중...', error: null };
+  runHubScrapeAll({ fromDate, toDate }).catch((e) => { hubState = { status: 'error', progress: '', error: e.message }; });
+  res.json({ started: true });
+});
+app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
+
+// 매일 알림 시간 1시간 뒤에 허브 수집(느리고 무거워서 알림과 겹치지 않게 띄운다)
+let hubTask = null;
+function scheduleHubScrape(time) {
+  if (hubTask) hubTask.stop();
+  const [hh, mm] = time.split(':').map(Number);
+  hubTask = cron.schedule(`${mm} ${(hh + 1) % 24} * * *`, () => {
+    if (hubState.status === 'running') return;
+    runHubScrapeAll().catch((e) => console.error('hub scrape failed:', e.message));
+  }, { timezone: 'Asia/Seoul' });
+}
+scheduleHubScrape(getSetting('alarm_time', '07:00'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));

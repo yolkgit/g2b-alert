@@ -117,6 +117,14 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
     </div>
 
     <div class="card">
+      <h2>단가·수량 수집 (조달데이터허브)</h2>
+      <div class="sub" id="hub-sub">아직 실행한 적 없음</div>
+      <button class="secondary" onclick="startHubScrape()" id="hub-btn">지금 수집</button>
+      <div class="sub" style="margin-top:6px">오픈API에 없는 <b>단가·수량·단위·조달방식</b>을 가져옵니다. 세부품명번호가 등록된 필터만 대상이며(품목 검색으로 추가), <b>최근 7일치</b>를 매일 알림 1시간 뒤 자동 수집합니다. 품목당 1~2분 걸립니다.</div>
+      <div class="err" id="hub-err"></div>
+    </div>
+
+    <div class="card">
       <h2>알림 받을 품목/지역 필터</h2>
       <label>품목 검색으로 정확한 품명 찾기 (선택)</label>
       <div class="row">
@@ -187,6 +195,9 @@ async function loadSettings() {
   if (s.lastBackfillAt) {
     document.getElementById('backfill-sub').textContent = `마지막 실행: ${new Date(s.lastBackfillAt).toLocaleString('ko-KR')} · ${s.lastBackfillSummary || ''}`;
   }
+  if (s.lastHubAt) {
+    document.getElementById('hub-sub').textContent = `마지막 수집: ${new Date(s.lastHubAt).toLocaleString('ko-KR')} · ${s.lastHubSummary || ''}`;
+  }
   document.getElementById('alarm-time').value = s.alarmTime || '07:00';
   window.__vapidKey = s.vapidPublicKey;
 }
@@ -223,6 +234,27 @@ async function changePassword() {
     document.getElementById('new-password').value = '';
     document.getElementById('new-password-confirm').value = '';
   } catch (e) { err.textContent = e.message; }
+}
+
+async function startHubScrape() {
+  const btn = document.getElementById('hub-btn');
+  const sub = document.getElementById('hub-sub');
+  const err = document.getElementById('hub-err');
+  err.textContent = '';
+  try {
+    await api('/api/hub-scrape', { method: 'POST', body: JSON.stringify({}) });
+  } catch (e) { err.textContent = e.message; return; }
+  btn.disabled = true; btn.textContent = '수집 중...';
+  const poll = setInterval(async () => {
+    const st = await api('/api/hub-scrape/status');
+    sub.textContent = st.progress || '';
+    if (st.status === 'done' || st.status === 'error') {
+      clearInterval(poll);
+      btn.disabled = false; btn.textContent = '지금 수집';
+      if (st.error) err.textContent = st.error;
+      await loadSettings(); await loadContracts();
+    }
+  }, 3000);
 }
 
 async function startBackfill() {
