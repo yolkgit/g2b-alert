@@ -345,7 +345,7 @@ const HUB_COLS = ['조달방식', '업무구분', '계약구분', '계약(납품
 
 async function loadContracts() {
   allContracts = await api('/api/contracts?limit=200');
-  hubItems = await api('/api/hub-items?limit=500').catch(() => []);
+  hubItems = await api('/api/hub-items?limit=1000').catch(() => []);
   renderContractTabs();
   renderContractList();
 }

@@ -3,8 +3,8 @@ data/
 data.db
 .env
 
-# 스크래퍼 실행 산출물(스크린샷·결과 덤프)
+# 스크래퍼 실행 산출물(스크린샷·다운로드 파일·결과 덤프)
 hub-*.png
 hub-*.html
-hub-result.json
-hub-result.csv
+hub-*.csv
+hub-*.json

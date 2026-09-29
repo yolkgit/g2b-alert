@@ -29,6 +29,7 @@ const ID = {
   pickSearch: 'comPopup_wframe_popupCnts_btnS0001',
   pickRow0: 'G_comPopup_wframe_popupCnts_grdList___checkbox_CHK_0',
   pickConfirm: 'comPopup_wframe_popupCnts_btnClose',    // value="확인"
+  csvDown: 'mf_popupCnts_btnCsvDown',
 };
 const sel = (id) => `[id="${id}"]`;
 
@@ -55,8 +56,14 @@ async function setCalendarRange(page, frame, fromYmd, toYmd) {
     const y = String(Number(ymd.slice(0, 4)));
     const m = String(Number(ymd.slice(4, 6)));
     const day = String(Number(ymd.slice(6, 8)));
-    await frame.selectOption(sel(`wq_uuid_157_${which}_selectbox_year`), y).catch(() => {});
-    await frame.selectOption(sel(`wq_uuid_157_${which}_selectbox_month`), m).catch(() => {});
+    // 주의: 이 select의 value에는 끝 공백이 있다("2026 ", "1 "). value로 고르면 조용히 실패하고
+    // 기본값이 남아 엉뚱한 기간으로 조회된다 — 반드시 label("2026년", "1월")로 고른다.
+    try {
+      await frame.selectOption(sel(`wq_uuid_157_${which}_selectbox_year`), { label: `${y}년` });
+      await frame.selectOption(sel(`wq_uuid_157_${which}_selectbox_month`), { label: `${m}월` });
+    } catch (e) {
+      console.log(`   [경고] ${which} 연/월 선택 실패:`, e.message.split('\n')[0]);
+    }
     await page.waitForTimeout(1200);
     // 해당 달력 컨테이너 안에서, 이전/다음달 흐린 칸을 빼고 날짜 숫자가 일치하는 셀을 클릭
     const ok = await frame.evaluate(({ which, day }) => {
@@ -76,6 +83,87 @@ async function setCalendarRange(page, frame, fromYmd, toYmd) {
   }
   await frame.click(sel('wq_uuid_157_btnChceCplt'), { timeout: 10000 }).catch(() => {});
   await page.waitForTimeout(1500);
+}
+
+// CSV다운로드: 버튼을 누르면 별도 창이 뜨고, 그 창의 "내보내기"를 눌러야 파일이 떨어진다.
+// 화면 표는 페이지당 100건이 상한이지만 내보내기는 전체 결과를 담는다.
+async function downloadCsv(page) {
+  const ctx = page.context();
+  const popupPromise = ctx.waitForEvent('page', { timeout: 30000 });
+  await page.mainFrame().click(sel(ID.csvDown), { timeout: 20000 });
+
+  let pop;
+  try { pop = await popupPromise; } catch { throw new Error('CSV 창이 열리지 않음'); }
+  await pop.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+  await pop.waitForTimeout(4000);
+  console.log('   [CSV] 창 열림:', pop.url().slice(0, 90));
+
+  const dlPromise = ctx.waitForEvent('download', { timeout: 120000 });
+  // 창 구조가 프레임으로 감싸여 있을 수 있어 모든 프레임에서 내보내기 버튼을 찾는다
+  let clicked = false;
+  for (const f of pop.frames()) {
+    clicked = await f.evaluate(() => {
+      const btn = [...document.querySelectorAll('input,button,a')]
+        .find((b) => /내보내기|export|다운로드|확인/i.test((b.value || b.textContent || '').trim()) && b.offsetParent);
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) break;
+  }
+  if (!clicked) {
+    // 못 찾았으면 창 안의 버튼 목록을 남겨서 다음 시도에 쓴다
+    const btns = await pop.mainFrame().evaluate(() =>
+      [...document.querySelectorAll('input,button,a')]
+        .map((b) => ({ id: b.id || null, text: (b.value || b.textContent || '').trim().slice(0, 30) }))
+        .filter((b) => b.text).slice(0, 25)).catch(() => []);
+    console.log('   [CSV] 내보내기 버튼 못 찾음. 창 안 버튼들:', JSON.stringify(btns).slice(0, 600));
+    await pop.screenshot({ path: 'hub-7-csv-window.png' }).catch(() => {});
+    throw new Error('내보내기 버튼을 찾지 못함 (hub-7-csv-window.png 확인)');
+  }
+
+  const dl = await dlPromise;
+  const out = 'hub-download.csv';
+  await dl.saveAs(out);
+  console.log(`   [CSV] 받음: ${dl.suggestedFilename()} → ${out}`);
+  await pop.close().catch(() => {});
+  return out;
+}
+
+// 받은 파일을 파싱한다. 실측 결과 이 내보내기는 이름만 .csv 이고 실제로는
+// UTF-16LE + 탭 구분이며, 앞쪽 45줄쯤이 "검색조건 : 프롬프트 N: ..." 머리말이다.
+function parseCsvFile(file) {
+  const buf = fs.readFileSync(file);
+  // BOM으로 인코딩 판별 (FF FE = UTF-16LE)
+  const text = (buf[0] === 0xFF && buf[1] === 0xFE)
+    ? buf.toString('utf16le').replace(/^﻿/, '')
+    : buf.toString('utf8').replace(/^﻿/, '');
+
+  // 구분자는 헤더 줄을 보고 정한다(탭 우선, 없으면 콤마)
+  const lines = text.split(/\r?\n/);
+  const hIdx = lines.findIndex((l) => l.includes('세부품명번호'));
+  if (hIdx < 0) return null;
+  const delim = lines[hIdx].includes('\t') ? '\t' : ',';
+
+  // 따옴표 안의 구분자·줄바꿈을 보존하는 최소 파서 (머리말은 건너뛴 뒤부터 처리)
+  const body = lines.slice(hIdx).join('\n');
+  const rows = [];
+  let row = [], cell = '', q = false;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (q) {
+      if (c === '"') { if (body[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === delim) { row.push(cell); cell = ''; }
+    else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+
+  const header = rows[0].map((h) => h.trim());
+  const data = rows.slice(1).filter((r) => r.length === header.length && r.some((v) => v.trim()));
+  return { header, rows: data.map((r) => Object.fromEntries(header.map((h, i) => [h, (r[i] || '').trim()]))) };
 }
 
 // 긁은 라인아이템을 앱 DB(hub_items)에 넣는다. 앱이 이 표를 화면에 그린다.
@@ -141,6 +229,83 @@ async function openReport(ctx) {
   return target;
 }
 
+// ── 기간 분할 ────────────────────────────────────────────────
+// 화면 표는 페이지당 100건이 상한이라 한 번에 그 이상은 못 읽는다(CSV 다운로드는 헤드리스에서
+// 이벤트가 발생하지 않아 못 씀). 그래서 기간을 잘라 각 조회가 100건 미만이 되게 하고,
+// 그래도 100건이 꽉 차면 그 구간을 반으로 더 쪼갠다.
+const PAGE_CAP = 100;
+const toDate = (ymd) => new Date(`${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T00:00:00Z`);
+const toYmd = (d) => d.toISOString().slice(0, 10).replace(/-/g, '');
+const addDays = (ymd, n) => toYmd(new Date(toDate(ymd).getTime() + n * 86400000));
+
+// [from, to]를 월 단위로 자른다
+function monthChunks(from, to) {
+  const out = [];
+  let cur = from;
+  while (cur <= to) {
+    const d = toDate(cur);
+    const lastOfMonth = toYmd(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)));
+    const end = lastOfMonth > to ? to : lastOfMonth;
+    out.push([cur, end]);
+    cur = addDays(end, 1);
+  }
+  return out;
+}
+
+// 결과 프레임에서 헤더행을 찾아 행 객체 배열로 바꾼다
+async function extractRows(scope) {
+  const parsed = await scope.evaluate(() => {
+    for (const t of document.querySelectorAll('table')) {
+      const rows = [...t.querySelectorAll('tr')]
+        .map((tr) => [...tr.querySelectorAll('th,td')].map((c) => c.innerText.replace(/\s+/g, ' ').trim()));
+      const hIdx = rows.findIndex((r) => r.length > 30 && r[0] === '조달방식' && r.includes('세부품명번호'));
+      if (hIdx < 0) continue;
+      const header = rows[hIdx];
+      const data = rows.slice(hIdx + 1).filter((r) => r.length === header.length && r[0] && r[0] !== '조달방식');
+      if (data.length) return { header, data };
+    }
+    return null;
+  }).catch(() => null);
+  if (!parsed) return [];
+  return parsed.data.map((r) => Object.fromEntries(parsed.header.map((h, i) => [h, r[i]])));
+}
+
+// 한 구간을 조회한다. 기간 설정이 어긋나면 조용히 넘어가지 않고 예외를 던진다.
+async function searchRange(page, form, dFrom, dTo) {
+  await setCalendarRange(page, form, dFrom, dTo);
+  const gotFrom = await readValue(form, ID.dateFrom);
+  const gotTo = await readValue(form, ID.dateTo);
+  if (gotFrom !== fmt(dFrom) || gotTo !== fmt(dTo)) {
+    throw new Error(`기간 설정 실패 (요청 ${fmt(dFrom)}~${fmt(dTo)}, 실제 ${gotFrom}~${gotTo})`);
+  }
+  await form.selectOption(sel(ID.pageSize), '100').catch(() => {});
+  await form.click(sel(ID.searchBtn), { timeout: 20000 });
+  await page.waitForTimeout(3000);
+  const warned = await dismissDialog(page, form);
+  if (warned) throw new Error('검증 경고: ' + warned.slice(0, 100));
+  await page.waitForTimeout(10000);
+
+  let mstr = null;
+  for (let i = 0; i < 12; i++) {
+    mstr = page.frames().find((f) => f.name() === 'mstrFrame' && f.url() !== 'about:blank');
+    if (mstr) break;
+    await page.waitForTimeout(4000);
+  }
+  return mstr ? extractRows(mstr) : [];
+}
+
+// 구간을 조회하되 100건(페이지 상한)이 꽉 차면 절반으로 쪼개 재귀 조회한다.
+async function collectRange(page, form, dFrom, dTo, depth = 0) {
+  const rows = await searchRange(page, form, dFrom, dTo);
+  const capped = rows.length >= PAGE_CAP && dFrom !== dTo && depth < 7;
+  log(`   ${dFrom}~${dTo}: ${rows.length}건${capped ? ' → 상한 도달, 분할' : ''}`);
+  if (!capped) return rows;
+  const mid = toYmd(new Date((toDate(dFrom).getTime() + toDate(dTo).getTime()) / 2));
+  const left = await collectRange(page, form, dFrom, mid, depth + 1);
+  const right = await collectRange(page, form, addDays(mid, 1), dTo, depth + 1);
+  return [...left, ...right];
+}
+
 function formFrame(target) {
   for (const f of target.frames()) {
     // 검색폼 프레임은 조회물품 셀렉트박스를 가지고 있다
@@ -157,7 +322,7 @@ function formFrame(target) {
   log(`조회: 세부품명번호=${code}, 기간=${dFrom}~${dTo}`);
 
   const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: 'ko-KR' });
+  const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: 'ko-KR', acceptDownloads: true });
 
   log('\n1. 보고서 팝업 열기...');
   const page = await openReport(ctx);
@@ -206,80 +371,65 @@ function formFrame(target) {
   log('   선택됨 →', await readValue(form, ID.itemInput));
   await shot(page, '3c-picked');
 
-  log('\n3-2. 기간·페이지당 건수 설정...');
-  // 날짜칸에 DOM 값만 주입하면 화면 표시는 바뀌어도 WebSquare 내부 모델이 갱신되지 않아
-  // "최대 12개월까지 조회 가능합니다" 검증에 걸린다. 그래서 기본값(오늘) 그대로 쓰는 경로를
-  // 기본으로 두고, 기간을 정말 바꿀 때만 달력 위젯을 실제로 조작한다.
-  if (from && to) {
-    await setCalendarRange(page, form, dFrom, dTo);
-    log('   기간:', await readValue(form, ID.dateFrom), '~', await readValue(form, ID.dateTo));
-  } else {
-    log('   기간 미지정 → 기본값 유지:', await readValue(form, ID.dateFrom), '~', await readValue(form, ID.dateTo));
-  }
-  await form.selectOption(sel(ID.pageSize), '100').catch(() => {});
-  await page.waitForTimeout(1000);
-  await shot(page, '4-filled');
-
-  log('\n4. 검색 클릭...');
-  await form.click(sel(ID.searchBtn), { timeout: 20000 });
-  await page.waitForTimeout(3000);
-  // 검증에 걸리면 여기서 "안내 메시지"가 뜬다 — 내용을 남기고 닫아야 다음 단계가 진행된다
-  const warned = await dismissDialog(page, form);
-  if (warned) log('   → 검색이 검증에 걸렸습니다. 위 메시지 확인 필요.');
-  log('   결과 대기 중(최대 90초)...');
-  await page.waitForTimeout(12000);
-
-  // MicroStrategy 결과 프레임이 채워지길 기다린다
-  let mstr = null;
-  for (let i = 0; i < 15; i++) {
-    mstr = page.frames().find((f) => f.name() === 'mstrFrame' && f.url() !== 'about:blank');
-    if (mstr) break;
-    await page.waitForTimeout(5000);
-  }
-  log('   mstrFrame:', mstr ? mstr.url().slice(0, 100) : '(로드 안 됨 - about:blank)');
-  await shot(page, '5-result');
-
-  log('\n5. 결과 추출...');
-  const scope = mstr || form;
-  // 헤더행("조달방식"으로 시작하고 칸이 아주 많은 행)을 찾고, 그 아래 같은 칸 수의 행을 데이터로 읽는다.
-  // MicroStrategy는 요약/중복 행도 같이 내보내므로 칸 수가 헤더와 일치하는 것만 남긴다.
-  const parsed = await scope.evaluate(() => {
-    for (const t of document.querySelectorAll('table')) {
-      const rows = [...t.querySelectorAll('tr')]
-        .map((tr) => [...tr.querySelectorAll('th,td')].map((c) => c.innerText.replace(/\s+/g, ' ').trim()));
-      const hIdx = rows.findIndex((r) => r.length > 30 && r[0] === '조달방식' && r.includes('세부품명번호'));
-      if (hIdx < 0) continue;
-      const header = rows[hIdx];
-      const data = rows.slice(hIdx + 1).filter((r) => r.length === header.length && r[0] && r[0] !== '조달방식');
-      if (data.length) return { header, data };
+  // CSV 내보내기는 전체 결과를 담으므로 먼저 시도하고, 안 되면 기간을 쪼개 화면을 긁는다.
+  log('\n4. 전체 기간 조회 후 CSV 내보내기 시도...');
+  let collected = [];
+  let viaCsv = false;
+  try {
+    await searchRange(page, form, dFrom, dTo);
+    await shot(page, '5-result');
+    const csv = parseCsvFile(await downloadCsv(page));
+    if (csv && csv.rows.length) {
+      collected = csv.rows;
+      viaCsv = true;
+      log(`   [CSV] 컬럼 ${csv.header.length}개 / ${collected.length}건`);
+    } else {
+      log('   [CSV] 파일에서 헤더를 못 찾음 — 기간 분할로 대체');
     }
-    return null;
-  }).catch((e) => { log('   추출 실패:', e.message.split('\n')[0]); return null; });
-
-  if (!parsed) {
-    log('   데이터 표 없음 (결과 0건이거나 화면 구조 변경)');
-  } else {
-    log(`   컬럼 ${parsed.header.length}개 / 데이터 ${parsed.data.length}건`);
-    const col = (n) => parsed.header.indexOf(n);
-    const show = ['계약(납품요구)일자', '수요기관', '세부품명', '품목명', '업체명', '단위'];
-    parsed.data.slice(0, 3).forEach((r, i) => {
-      log(`   [${i}]`, JSON.stringify(Object.fromEntries(
-        show.filter((n) => col(n) >= 0).map((n) => [n, r[col(n)]]))).slice(0, 320));
-    });
-    // 단가·수량 계열 컬럼은 이름이 길어 따로 확인
-    const numeric = parsed.header.filter((h) => /수량|단가|금액/.test(h));
-    log('   수량/단가/금액 컬럼:', JSON.stringify(numeric).slice(0, 300));
-
-    const rowsObj = parsed.data.map((r) => Object.fromEntries(parsed.header.map((h, i) => [h, r[i]])));
-    fs.writeFileSync('hub-result.json', JSON.stringify({ code, from: dFrom, to: dTo, rows: rowsObj }, null, 2));
-    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    fs.writeFileSync('hub-result.csv',
-      '﻿' + [parsed.header.map(esc).join(','), ...parsed.data.map((r) => r.map(esc).join(','))].join('\r\n'));
-    log('   저장: hub-result.json / hub-result.csv');
-    saveToDb(rowsObj);
+  } catch (e) {
+    log('   [CSV] 실패:', e.message.split('\n')[0]);
   }
 
-  try { fs.writeFileSync('hub-result.html', await scope.content()); } catch {}
+  if (!viaCsv) {
+    log('\n4-2. 기간을 나눠 화면 조회...');
+    // 화면 표는 한 번에 100건까지만 읽히므로 월 단위로 자르고, 그래도 꽉 차면 더 쪼갠다.
+    const chunks = (from && to) ? monthChunks(dFrom, dTo) : [[dFrom, dTo]];
+    log(`   구간 ${chunks.length}개`);
+    for (const [cFrom, cTo] of chunks) {
+      try {
+        collected.push(...await collectRange(page, form, cFrom, cTo));
+      } catch (e) {
+        log(`   [실패] ${cFrom}~${cTo}: ${e.message.split('\n')[0]}`);
+      }
+    }
+    await shot(page, '5-result');
+  }
+
+  // 같은 라인아이템이 구간 경계나 중복 렌더링으로 겹칠 수 있어 키로 중복 제거
+  const seen = new Set();
+  const rows = collected.filter((r) => {
+    const k = [r['계약(납품요구)번호'], r['변경차수'], r['물품순번']].join('|');
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  log(`\n5. 수집 완료(${viaCsv ? 'CSV' : '화면 분할'}): 원본 ${collected.length}건 → 중복 제거 후 ${rows.length}건`);
+
+  if (!rows.length) {
+    log('   결과 없음');
+  } else {
+    const show = ['계약(납품요구)일자', '수요기관', '품목명', '업체명', '단위', '계약납품단가', '계약납품수량'];
+    rows.slice(0, 3).forEach((r, i) =>
+      log(`   [${i}]`, JSON.stringify(Object.fromEntries(show.filter((n) => n in r).map((n) => [n, r[n]]))).slice(0, 320)));
+
+    const header = Object.keys(rows[0]);
+    const esc = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+    fs.writeFileSync('hub-result.json', JSON.stringify({ code, from: dFrom, to: dTo, rows }, null, 2));
+    fs.writeFileSync('hub-result.csv',
+      '﻿' + [header.map(esc).join(','), ...rows.map((r) => header.map((h) => esc(r[h])).join(','))].join('\r\n'));
+    log('   저장: hub-result.json / hub-result.csv');
+    saveToDb(rows);
+  }
 
   await browser.close();
 })().catch((e) => { console.error('ERROR:', e.message); process.exit(1); });
