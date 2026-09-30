@@ -41,10 +41,37 @@ db.exec(`
     PRIMARY KEY (contract_no, chg_seq, item_seq)
   );
   CREATE INDEX IF NOT EXISTS idx_hub_items_code_date ON hub_items (item_code, contract_date);
+  -- 품목별로 "이 기간은 허브에서 확실히 다 긁어왔다"를 기록한다(여러 구간이 있을 수 있어
+  -- item_code당 여러 행 허용). 조회 화면에서 이미 커버된 기간은 다시 안 긁고 DB에서 바로 보여주고,
+  -- 빠진 구간만 골라서 긁는 데 쓴다.
+  CREATE TABLE IF NOT EXISTS hub_coverage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_code TEXT NOT NULL,
+    from_date TEXT NOT NULL,
+    to_date TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_hub_coverage_code ON hub_coverage (item_code);
 `);
 
 // filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
 try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
+
+// hub_coverage는 이 기능이 생기기 전부터 이미 hub_items에 쌓여 있던 자료를 모른다 — 그대로 두면
+// "조회" 버튼이 이미 가진 자료까지 전부 빠진 걸로 보고 다시 긁으려 든다. 커버리지가 비어 있는
+// 품목은, 이미 저장된 자료의 최소~최대 계약일자 범위를 1회성으로 커버리지에 채워준다.
+{
+  const codes = db.prepare(`
+    SELECT item_code, MIN(contract_date) minD, MAX(contract_date) maxD FROM hub_items
+    WHERE item_code IS NOT NULL AND item_code NOT IN (SELECT DISTINCT item_code FROM hub_coverage)
+    GROUP BY item_code
+  `).all();
+  const ins = db.prepare(`INSERT INTO hub_coverage (item_code, from_date, to_date) VALUES (?, ?, ?)`);
+  for (const c of codes) {
+    if (!c.minD || !c.maxD) continue;
+    ins.run(c.item_code, c.minD, c.maxD);
+    console.log(`[hub] 기존 자료로 커버리지 초기화: ${c.item_code} ${c.minD}~${c.maxD}`);
+  }
+}
 
 function getSetting(key, fallback = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
@@ -195,15 +222,75 @@ async function sendPushToAll(payload) {
 function fmtDate(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
+function addDaysYmd(ymd, n) {
+  const d = new Date(`${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return fmtDate(d);
+}
+
+// ─── 품목별 수집 커버리지(어느 기간까지 이미 긁었는지) ──────────
+function getCoverageIntervals(itemCode) {
+  return db.prepare(`SELECT from_date, to_date FROM hub_coverage WHERE item_code = ? ORDER BY from_date`).all(itemCode);
+}
+
+// [qFrom, qTo] 중 아직 안 긁은 구간만 뽑아낸다(0개면 전부 커버됨 = DB에서 바로 보여주면 됨).
+function findMissingRanges(itemCode, qFrom, qTo) {
+  const intervals = getCoverageIntervals(itemCode);
+  let cursor = qFrom;
+  const missing = [];
+  for (const iv of intervals) {
+    if (iv.to_date < cursor || iv.from_date > qTo) continue;
+    if (iv.from_date > cursor) missing.push([cursor, addDaysYmd(iv.from_date, -1)]);
+    if (iv.to_date >= cursor) cursor = addDaysYmd(iv.to_date, 1);
+  }
+  if (cursor <= qTo) missing.push([cursor, qTo]);
+  return missing;
+}
+
+// 새로 긁은 구간을 커버리지에 추가하고, 겹치거나 붙어 있는 구간은 하나로 합친다.
+function mergeCoverage(itemCode, newFrom, newTo) {
+  const all = [...getCoverageIntervals(itemCode), { from_date: newFrom, to_date: newTo }]
+    .sort((a, b) => (a.from_date < b.from_date ? -1 : 1));
+  const merged = [];
+  for (const iv of all) {
+    const last = merged[merged.length - 1];
+    if (last && iv.from_date <= addDaysYmd(last.to_date, 1)) {
+      if (iv.to_date > last.to_date) last.to_date = iv.to_date;
+    } else {
+      merged.push({ ...iv });
+    }
+  }
+  db.prepare(`DELETE FROM hub_coverage WHERE item_code = ?`).run(itemCode);
+  const ins = db.prepare(`INSERT INTO hub_coverage (item_code, from_date, to_date) VALUES (?, ?, ?)`);
+  for (const iv of merged) ins.run(itemCode, iv.from_date, iv.to_date);
+}
 
 // 조달데이터허브에서 긁어온 라인아이템. 필터 키워드(=세부품명)나 코드로 좁혀서 본다.
+// 기간(from/to)과 페이지(page/pageSize)로 서버 사이드 페이지네이션한다.
 app.get('/api/hub-items', (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(Math.max(1, Number(req.query.pageSize) || 20), 200);
   const code = (req.query.code || '').trim();
-  const rows = code
-    ? db.prepare(`SELECT raw_json FROM hub_items WHERE item_code = ? ORDER BY contract_date DESC LIMIT ?`).all(code, limit)
-    : db.prepare(`SELECT raw_json FROM hub_items ORDER BY contract_date DESC LIMIT ?`).all(limit);
-  res.json(rows.map((r) => JSON.parse(r.raw_json)));
+  const from = (req.query.from || '').trim();
+  const to = (req.query.to || '').trim();
+
+  const conds = [], params = [];
+  if (code) { conds.push('item_code = ?'); params.push(code); }
+  if (from) { conds.push('contract_date >= ?'); params.push(from); }
+  if (to) { conds.push('contract_date <= ?'); params.push(to); }
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${where}`).get(...params).c;
+  const rows = db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY contract_date DESC LIMIT ? OFFSET ?`)
+    .all(...params, pageSize, (page - 1) * pageSize);
+  res.json({ rows: rows.map((r) => JSON.parse(r.raw_json)), total, page, pageSize });
+});
+
+// 탭 라벨에 쓰는 품목별 전체 건수(기간 필터 없이) — 표 페이지네이션과 별개로 가볍게 조회.
+app.get('/api/hub-items/counts', (req, res) => {
+  const byCode = db.prepare(`SELECT item_code, COUNT(*) c FROM hub_items GROUP BY item_code`).all();
+  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items`).get().c;
+  res.json({ total, byCode: Object.fromEntries(byCode.map((r) => [r.item_code, r.c])) });
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -299,6 +386,7 @@ async function runHubScrapeAll({ fromDate, toDate } = {}) {
     const r = await runHubScrape(f.item_code, fromDate, toDate);
     done.push(`${f.keyword} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`);
     if (r.exitCode !== 0) console.error(`[hub] ${f.keyword} 실패:\n${r.tail.slice(-600)}`);
+    else mergeCoverage(f.item_code, fromDate, toDate);
     if (r.newRows && r.newRows.length) await notifyNewHubRows(f, r.newRows);
   }
   const summary = `${new Date().toLocaleString('ko-KR')} · ${done.join(', ')}`;
@@ -329,6 +417,40 @@ app.post('/api/hub-scrape', (req, res) => {
   res.json({ started: true });
 });
 app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
+
+// 표 위쪽 "조회" 버튼용: 이미 긁어놓은 기간이면 바로 DB에서 보여주면 되니 아무것도 안 하고,
+// 빠진 구간이 있을 때만 그 구간만 골라서 긁는다(알림은 안 보냄 — 조회는 알림과 무관).
+app.post('/api/hub-query', (req, res) => {
+  if (hubState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
+  const { itemCode, fromDate, toDate } = req.body || {};
+  if (!/^\d{8}$/.test(fromDate || '') || !/^\d{8}$/.test(toDate || '') || fromDate > toDate) {
+    return res.status(400).json({ error: '조회 기간이 올바르지 않습니다' });
+  }
+  const codes = itemCode
+    ? [itemCode]
+    : db.prepare(`SELECT DISTINCT item_code FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all().map((r) => r.item_code);
+  if (!codes.length) return res.status(400).json({ error: '조회할 품목이 없습니다' });
+
+  const gaps = [];
+  for (const code of codes) {
+    for (const [gFrom, gTo] of findMissingRanges(code, fromDate, toDate)) gaps.push({ code, gFrom, gTo });
+  }
+  if (!gaps.length) return res.json({ needsScrape: false });
+
+  hubState = { status: 'running', progress: '빠진 기간 확인됨, 수집 준비 중...', error: null };
+  (async () => {
+    for (let i = 0; i < gaps.length; i++) {
+      const { code, gFrom, gTo } = gaps[i];
+      hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) 수집 중...`, error: null };
+      const r = await runHubScrape(code, gFrom, gTo);
+      if (r.exitCode === 0) mergeCoverage(code, gFrom, gTo);
+      else console.error(`[hub-query] ${code} (${gFrom}~${gTo}) 실패:\n${r.tail.slice(-600)}`);
+    }
+    hubState = { status: 'done', progress: '조회 완료', error: null };
+  })().catch((e) => { hubState = { status: 'error', progress: '', error: e.message }; });
+
+  res.json({ needsScrape: true, started: true });
+});
 
 // 설정된 알림 시간에 허브 수집을 돌린다 — 이게 곧 매일 알림이다(신규 항목이 있으면 푸시 발송).
 let hubTask = null;

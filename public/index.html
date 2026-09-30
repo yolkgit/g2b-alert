@@ -127,6 +127,12 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
     <div class="card">
       <h2>특정품목 조달 내역 <span class="pill" id="hub-pill" style="display:none"></span></h2>
       <div class="tabs" id="contract-tabs"></div>
+      <div class="row" style="align-items:flex-end;margin-bottom:8px">
+        <div><label>시작일</label><input type="date" id="query-from"></div>
+        <div><label>종료일</label><input type="date" id="query-to"></div>
+        <button style="flex:none" onclick="runQuery()" id="query-btn">조회</button>
+      </div>
+      <div class="err" id="query-err"></div>
       <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
       <div class="table-scroll">
         <table>
@@ -135,6 +141,11 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
         </table>
       </div>
       <div class="sub" id="contract-empty" style="margin-top:8px">아직 없음</div>
+      <div class="row" id="pager" style="margin-top:10px;justify-content:center;gap:8px;display:none">
+        <button class="secondary" style="flex:none" onclick="gotoPage(currentPage-1)" id="pager-prev">이전</button>
+        <span class="sub" id="pager-info" style="flex:none;align-self:center"></span>
+        <button class="secondary" style="flex:none" onclick="gotoPage(currentPage+1)" id="pager-next">다음</button>
+      </div>
     </div>
   </div>
 </div>
@@ -162,7 +173,23 @@ async function boot() {
   const { authed } = await api('/api/session');
   document.getElementById('login-view').style.display = authed ? 'none' : 'flex';
   document.getElementById('main-view').style.display = authed ? 'block' : 'none';
-  if (authed) { await loadSettings(); await loadFilters(); await loadContracts(); }
+  if (authed) {
+    initQueryDates();
+    await loadSettings(); await loadFilters(); await loadContracts();
+  }
+}
+
+// 종료일을 오늘로 두면 허브 쪽 달력이 항상 하루 전으로 튕겨나가 조회가 실패하므로(집계가
+// 아직 안 끝난 걸로 보임) 종료일 선택 상한을 어제로 막고, 기본값도 최근 30일로 채워준다.
+function initQueryDates() {
+  const toDate = (d) => d.toISOString().slice(0, 10);
+  const yesterday = toDate(new Date(Date.now() - 86400000));
+  const monthAgo = toDate(new Date(Date.now() - 30 * 86400000));
+  const fromEl = document.getElementById('query-from'), toEl = document.getElementById('query-to');
+  toEl.max = yesterday;
+  fromEl.max = yesterday;
+  fromEl.value = monthAgo;
+  toEl.value = yesterday;
 }
 
 async function loadSettings() {
@@ -306,15 +333,22 @@ async function addFilter() {
 }
 
 let activeFilterId = 'all';
-let hubItems = [];   // 조달데이터허브에서 긁어온 라인아이템(단가·수량·단위 포함)
+let tabCounts = { total: 0, byCode: {} }; // 탭 라벨용 품목별 전체 건수(기간 필터와 무관)
+let currentPage = 1;
+const PAGE_SIZE = 20;
+let queryFrom = '', queryTo = ''; // "조회" 버튼으로 적용된 기간(YYYY-MM-DD). 비어있으면 기간 제한 없음.
 
 const HUB_COLS = ['조달방식', '업무구분', '계약구분', '계약(납품요구)일자', '수요기관', '수요기관소재시군구',
   '세부품명번호', '세부품명', '품목명', '업체명', '낙찰방법', '단위', '계약납품단가', '계약납품수량', '공급금액'];
 
 async function loadContracts() {
-  hubItems = await api('/api/hub-items?limit=1000').catch(() => []);
+  await loadTabCounts();
   renderContractTabs();
-  renderContractList();
+  await loadTablePage();
+}
+
+async function loadTabCounts() {
+  tabCounts = await api('/api/hub-items/counts').catch(() => ({ total: 0, byCode: {} }));
 }
 
 // 탭은 등록된 필터 전체를 기준으로 만든다(허브 수집을 아직 안 돌린 필터도 0건 탭으로 보이게).
@@ -327,12 +361,12 @@ function renderContractTabs() {
     const btn = document.createElement('button');
     btn.textContent = label;
     btn.className = id === activeFilterId ? 'active' : '';
-    btn.onclick = () => { activeFilterId = id; renderContractTabs(); renderContractList(); };
+    btn.onclick = () => { activeFilterId = id; currentPage = 1; renderContractTabs(); loadTablePage(); };
     tabs.appendChild(btn);
   };
-  makeTab('all', `전체 (${hubItems.length})`);
+  makeTab('all', `전체 (${tabCounts.total})`);
   for (const f of allFilters) {
-    const count = f.item_code ? hubItems.filter((h) => h['세부품명번호'] === f.item_code).length : 0;
+    const count = f.item_code ? (tabCounts.byCode[f.item_code] || 0) : 0;
     makeTab(f.id, `${f.keyword}${f.region ? ' · ' + f.region : ''} (${count})`);
   }
 }
@@ -352,29 +386,90 @@ function activeItemCode() {
   return f ? f.item_code : null;
 }
 
-function renderContractList() {
+async function loadTablePage() {
+  const code = activeItemCode();
+  const params = new URLSearchParams({ page: currentPage, pageSize: PAGE_SIZE });
+  if (code) params.set('code', code);
+  if (queryFrom) params.set('from', queryFrom.replace(/-/g, ''));
+  if (queryTo) params.set('to', queryTo.replace(/-/g, ''));
+  const data = await api('/api/hub-items?' + params.toString()).catch(() => ({ rows: [], total: 0 }));
+  renderTable(data);
+}
+
+function renderTable({ rows, total }) {
   const tbody = document.getElementById('contract-tbody');
   const empty = document.getElementById('contract-empty');
   const pill = document.getElementById('hub-pill');
   const note = document.getElementById('hub-note');
+  const pager = document.getElementById('pager');
   tbody.innerHTML = '';
 
-  const code = activeItemCode();
-  const hubRows = code ? hubItems.filter((h) => h['세부품명번호'] === code) : hubItems;
-
   setHeader(HUB_COLS);
-  empty.style.display = hubRows.length ? 'none' : 'block';
-  if (hubRows.length) {
+  empty.style.display = rows.length ? 'none' : 'block';
+  if (total) {
     pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
-    note.style.display = ''; note.textContent = `조달데이터허브 자료 ${hubRows.length}건`;
+    note.style.display = ''; note.textContent = `조달데이터허브 자료 ${total}건`;
   } else {
     pill.style.display = 'none';
     note.style.display = 'none';
   }
-  for (const h of hubRows) {
+  for (const h of rows) {
     const tr = document.createElement('tr');
     tr.innerHTML = HUB_COLS.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
     tbody.appendChild(tr);
+  }
+
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  pager.style.display = total > PAGE_SIZE ? 'flex' : 'none';
+  document.getElementById('pager-info').textContent = `${currentPage} / ${pageCount} 페이지`;
+  document.getElementById('pager-prev').disabled = currentPage <= 1;
+  document.getElementById('pager-next').disabled = currentPage >= pageCount;
+}
+
+function gotoPage(p) {
+  if (p < 1) return;
+  currentPage = p;
+  loadTablePage();
+}
+
+// "조회" 버튼: 선택한 기간이 이미 다 긁어져 있으면 바로 DB에서 보여주고, 빠진 구간만 있을 때만
+// 서버가 그 구간만 골라 허브에서 긁는다(알림은 안 감 — 그냥 조회용).
+async function runQuery() {
+  const fromEl = document.getElementById('query-from'), toEl = document.getElementById('query-to');
+  const err = document.getElementById('query-err');
+  const btn = document.getElementById('query-btn');
+  err.textContent = '';
+  const from = fromEl.value, to = toEl.value;
+  if (!from || !to) { err.textContent = '시작일과 종료일을 모두 선택하세요'; return; }
+  if (from > to) { err.textContent = '시작일이 종료일보다 늦습니다'; return; }
+  queryFrom = from; queryTo = to; currentPage = 1;
+
+  const code = activeItemCode();
+  btn.disabled = true; btn.textContent = '확인 중...';
+  try {
+    const result = await api('/api/hub-query', {
+      method: 'POST',
+      body: JSON.stringify({ itemCode: code, fromDate: from.replace(/-/g, ''), toDate: to.replace(/-/g, '') }),
+    });
+    if (!result.needsScrape) {
+      btn.disabled = false; btn.textContent = '조회';
+      await loadTablePage();
+      return;
+    }
+    btn.textContent = '조회 중...';
+    const poll = setInterval(async () => {
+      const st = await api('/api/hub-scrape/status');
+      if (st.status === 'done' || st.status === 'error') {
+        clearInterval(poll);
+        btn.disabled = false; btn.textContent = '조회';
+        if (st.error) err.textContent = st.error;
+        await loadTabCounts(); renderContractTabs();
+        await loadTablePage();
+      }
+    }, 2000);
+  } catch (e) {
+    err.textContent = e.message;
+    btn.disabled = false; btn.textContent = '조회';
   }
 }
 
