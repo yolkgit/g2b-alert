@@ -130,9 +130,9 @@ pre{background:var(--muted);border:1px solid var(--border);border-radius:calc(va
 
     <div class="card">
       <h2>알림 받을 품목/지역</h2>
-      <div class="row">
-        <input id="item-search" style="flex:2" placeholder="품목 검색 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
-        <input id="filter-region" style="flex:1" placeholder="지역(선택)">
+      <div class="row" style="align-items:flex-end">
+        <input id="item-search" style="flex:2;margin-bottom:0" placeholder="품목 검색 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
+        <input id="filter-region" style="flex:1;margin-bottom:0" placeholder="지역(선택)">
         <button class="secondary" style="flex:none" onclick="searchItems()">검색</button>
       </div>
       <div id="item-search-err" class="err"></div>
@@ -144,9 +144,9 @@ pre{background:var(--muted);border:1px solid var(--border);border-radius:calc(va
       <h2>특정품목 조달 내역 <span class="pill" id="hub-pill" style="display:none"></span></h2>
       <div class="tabs" id="contract-tabs"></div>
       <div class="row" style="align-items:flex-end;margin-bottom:8px">
-        <div><label>시작일</label><input type="date" id="query-from"></div>
-        <div><label>종료일</label><input type="date" id="query-to"></div>
-        <button style="flex:none" onclick="runQuery()" id="query-btn">조회</button>
+        <div><label>시작일</label><input type="date" id="query-from" style="margin-bottom:0"></div>
+        <div><label>종료일</label><input type="date" id="query-to" style="margin-bottom:0"></div>
+        <div style="flex:none"><label style="visibility:hidden">조회</label><button style="flex:none" onclick="runQuery()" id="query-btn">조회</button></div>
       </div>
       <div class="err" id="query-err"></div>
       <div id="hub-progress" style="display:none;margin-bottom:8px">
