@@ -434,13 +434,8 @@ async function notifyNewHubRows(filter, rows) {
   });
 }
 
-app.post('/api/hub-scrape', (req, res) => {
-  if (hubState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
-  const { fromDate, toDate } = req.body || {};
-  hubState = { status: 'running', progress: '시작 중...', percent: 0, error: null };
-  runHubScrapeAll({ fromDate, toDate }).catch((e) => { hubState = { status: 'error', progress: '', percent: 0, error: e.message }; });
-  res.json({ started: true });
-});
+// 상태 조회만 남긴다 — 수동 "지금 확인하기" 버튼은 없앴고(매일 자동 실행으로 충분, 표의
+// "조회"는 알림 없이 조회만 함), hub-query가 트는 수집의 진행 상황을 폴링하는 데 쓰인다.
 app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
 
 // 표 위쪽 "조회" 버튼용: 이미 긁어놓은 기간이면 바로 DB에서 보여주면 되니 아무것도 안 하고,
