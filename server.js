@@ -306,9 +306,19 @@ app.post('/api/settings/alarm-time', (req, res) => {
 // ─── 조달데이터허브 수집(단가·수량·단위) ──────────────────────
 // 헤드리스 브라우저를 띄우는 무거운 작업이라 서버 프로세스와 분리해 자식 프로세스로 돌린다.
 // 브라우저가 죽더라도 앱 본체는 영향받지 않는다.
-let hubState = { status: 'idle', progress: '', error: null };
+let hubState = { status: 'idle', progress: '', percent: 0, error: null };
 
-function runHubScrape(code, fromDate, toDate) {
+// scrape-hub.js는 "1. 보고서 팝업 열기...", "2. 조회물품을...", ..., "5. 수집 완료..." 처럼
+// 단계마다 번호를 찍는다. 그 줄을 실시간으로 잡아서(자식 프로세스가 끝나야만 아는 게 아니라)
+// 현재 몇 단계인지 onStep으로 알려준다 — 화면에서 "멈췄나 진행 중인가" 구분이 안 되던 문제 해결용.
+const HUB_STEP_COUNT = 5;
+// index/total = 지금까지 끝난 품목 비율, step = 지금 품목 안에서 몇 단계(1~5)인지.
+function stepPercent(index, total, step) {
+  const base = index / total;
+  const slice = (1 / total) * (step ? (step - 1) / HUB_STEP_COUNT : 0);
+  return Math.min(99, Math.round((base + slice) * 100));
+}
+function runHubScrape(code, fromDate, toDate, onStep) {
   return new Promise((resolve) => {
     const newRowsFile = path.join(path.dirname(DB_PATH), `hub-new-${code}-${process.pid}.json`);
     const args = [path.join(__dirname, 'scripts', 'scrape-hub.js'), code];
@@ -318,7 +328,20 @@ function runHubScrape(code, fromDate, toDate) {
       env: { ...process.env, HUB_SHOTS: '0', NEW_ROWS_FILE: newRowsFile }, // 서버에선 스크린샷 생략
     });
     let tail = '';
-    const keep = (buf) => { tail = (tail + buf.toString()).slice(-2000); };
+    let lineBuf = '';
+    const keep = (buf) => {
+      const s = buf.toString();
+      tail = (tail + s).slice(-2000);
+      if (!onStep) return;
+      lineBuf += s;
+      let idx;
+      while ((idx = lineBuf.indexOf('\n')) >= 0) {
+        const line = lineBuf.slice(0, idx);
+        lineBuf = lineBuf.slice(idx + 1);
+        const m = line.match(/^(\d+)(?:-\d+)?\.\s*(.+)/);
+        if (m) onStep(Number(m[1]), m[2].trim());
+      }
+    };
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
     child.on('close', (exitCode) => {
@@ -376,14 +399,16 @@ async function runHubScrapeAll({ fromDate, toDate } = {}) {
 
   const filters = db.prepare(`SELECT * FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all();
   if (!filters.length) {
-    hubState = { status: 'error', progress: '', error: '세부품명번호를 확인할 수 없습니다. 필터의 품목명이 정확한지(예: 고상제설제) 확인하거나, 품목 검색으로 다시 추가해 주세요.' };
+    hubState = { status: 'error', progress: '', percent: 0, error: '세부품명번호를 확인할 수 없습니다. 필터의 품목명이 정확한지(예: 고상제설제) 확인하거나, 품목 검색으로 다시 추가해 주세요.' };
     return;
   }
   const done = [];
   for (let i = 0; i < filters.length; i++) {
     const f = filters[i];
-    hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) 수집 중...`, error: null };
-    const r = await runHubScrape(f.item_code, fromDate, toDate);
+    hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) 수집 중...`, percent: stepPercent(i, filters.length), error: null };
+    const r = await runHubScrape(f.item_code, fromDate, toDate, (step, label) => {
+      hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) — ${label}`, percent: stepPercent(i, filters.length, step), error: null };
+    });
     done.push(`${f.keyword} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`);
     if (r.exitCode !== 0) console.error(`[hub] ${f.keyword} 실패:\n${r.tail.slice(-600)}`);
     else mergeCoverage(f.item_code, fromDate, toDate);
@@ -392,7 +417,7 @@ async function runHubScrapeAll({ fromDate, toDate } = {}) {
   const summary = `${new Date().toLocaleString('ko-KR')} · ${done.join(', ')}`;
   setSetting('last_hub_at', new Date().toISOString());
   setSetting('last_hub_summary', summary);
-  hubState = { status: 'done', progress: summary, error: null };
+  hubState = { status: 'done', progress: summary, percent: 100, error: null };
 }
 
 // 이번 수집에서 새로 발견된(=hub_items에 처음 들어간) 라인아이템을 필터별로 알림 보낸다.
@@ -412,8 +437,8 @@ async function notifyNewHubRows(filter, rows) {
 app.post('/api/hub-scrape', (req, res) => {
   if (hubState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
   const { fromDate, toDate } = req.body || {};
-  hubState = { status: 'running', progress: '시작 중...', error: null };
-  runHubScrapeAll({ fromDate, toDate }).catch((e) => { hubState = { status: 'error', progress: '', error: e.message }; });
+  hubState = { status: 'running', progress: '시작 중...', percent: 0, error: null };
+  runHubScrapeAll({ fromDate, toDate }).catch((e) => { hubState = { status: 'error', progress: '', percent: 0, error: e.message }; });
   res.json({ started: true });
 });
 app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
@@ -437,17 +462,19 @@ app.post('/api/hub-query', (req, res) => {
   }
   if (!gaps.length) return res.json({ needsScrape: false });
 
-  hubState = { status: 'running', progress: '빠진 기간 확인됨, 수집 준비 중...', error: null };
+  hubState = { status: 'running', progress: '빠진 기간 확인됨, 수집 준비 중...', percent: 0, error: null };
   (async () => {
     for (let i = 0; i < gaps.length; i++) {
       const { code, gFrom, gTo } = gaps[i];
-      hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) 수집 중...`, error: null };
-      const r = await runHubScrape(code, gFrom, gTo);
+      hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) 수집 중...`, percent: stepPercent(i, gaps.length), error: null };
+      const r = await runHubScrape(code, gFrom, gTo, (step, label) => {
+        hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) — ${label}`, percent: stepPercent(i, gaps.length, step), error: null };
+      });
       if (r.exitCode === 0) mergeCoverage(code, gFrom, gTo);
       else console.error(`[hub-query] ${code} (${gFrom}~${gTo}) 실패:\n${r.tail.slice(-600)}`);
     }
-    hubState = { status: 'done', progress: '조회 완료', error: null };
-  })().catch((e) => { hubState = { status: 'error', progress: '', error: e.message }; });
+    hubState = { status: 'done', progress: '조회 완료', percent: 100, error: null };
+  })().catch((e) => { hubState = { status: 'error', progress: '', percent: 0, error: e.message }; });
 
   res.json({ needsScrape: true, started: true });
 });

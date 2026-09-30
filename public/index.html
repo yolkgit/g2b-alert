@@ -101,6 +101,12 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
         <button onclick="startHubScrape()" id="hub-btn">지금 계약 조회</button>
         <button class="secondary" onclick="enablePush()" id="push-btn">홈화면 알림 켜기</button>
       </div>
+      <div id="hub-progress" style="display:none;margin-top:8px">
+        <div class="sub" id="hub-progress-text"></div>
+        <div style="background:#e5e8ec;border-radius:3px;height:8px;overflow:hidden;margin-top:4px">
+          <div id="hub-progress-bar" style="background:#1c3f6e;height:100%;width:0%;transition:width .4s"></div>
+        </div>
+      </div>
       <div class="sub" style="margin-top:6px">조달데이터허브에서 <b>단가·수량·단위·조달방식</b>까지 긁어옵니다(오픈API엔 없는 값). 세부품명번호가 등록된 필터만 대상이며(품목 검색으로 추가), 최근 7일치를 매일 알림 시간에 자동 실행하고 신규 항목이 있으면 푸시로 알립니다. 품목당 1~2분 걸립니다.</div>
       <div class="err" id="hub-err"></div>
     </div>
@@ -241,6 +247,23 @@ async function changePassword() {
   } catch (e) { err.textContent = e.message; }
 }
 
+// 진행 바는 hub-scrape든 hub-query든 어느 쪽이 돌든 공유한다(동시에 하나만 돌 수 있어서).
+// %가 안 움직이면 멈춘 걸로 착각하기 쉬워서, 스크래퍼 내부 1~5단계 로그를 서버가 실시간으로
+// 읽어 percent로 환산해준 걸 그대로 바 너비에 반영한다.
+function updateHubProgress(st) {
+  const box = document.getElementById('hub-progress');
+  const text = document.getElementById('hub-progress-text');
+  const bar = document.getElementById('hub-progress-bar');
+  if (st.status === 'running') {
+    box.style.display = 'block';
+    text.textContent = `${st.progress || '진행 중...'} (${st.percent ?? 0}%)`;
+    bar.style.width = `${st.percent ?? 0}%`;
+  } else {
+    box.style.display = 'none';
+    bar.style.width = '0%';
+  }
+}
+
 async function startHubScrape() {
   const btn = document.getElementById('hub-btn');
   const sub = document.getElementById('hub-sub');
@@ -253,13 +276,14 @@ async function startHubScrape() {
   const poll = setInterval(async () => {
     const st = await api('/api/hub-scrape/status');
     sub.textContent = st.progress || '';
+    updateHubProgress(st);
     if (st.status === 'done' || st.status === 'error') {
       clearInterval(poll);
       btn.disabled = false; btn.textContent = '지금 계약 조회';
       if (st.error) err.textContent = st.error;
       await loadSettings(); await loadContracts();
     }
-  }, 3000);
+  }, 2000);
 }
 
 async function saveServiceKey() {
@@ -459,6 +483,7 @@ async function runQuery() {
     btn.textContent = '조회 중...';
     const poll = setInterval(async () => {
       const st = await api('/api/hub-scrape/status');
+      updateHubProgress(st);
       if (st.status === 'done' || st.status === 'error') {
         clearInterval(poll);
         btn.disabled = false; btn.textContent = '조회';
