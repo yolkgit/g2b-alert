@@ -275,8 +275,11 @@ async function fillMissingItemCodes() {
 // 기간을 안 주면 최근 7일치를 본다 — 오늘 하루만 보면 아직 계약이 안 올라와 0건이 되기 쉽다.
 async function runHubScrapeAll({ fromDate, toDate } = {}) {
   if (!fromDate || !toDate) {
-    const end = new Date();
-    const begin = new Date(end.getTime() - 7 * 86400000);
+    // 종료일을 오늘로 주면 조달데이터허브 달력에서 항상 하루 전으로 튕겨나가 조회 자체가
+    // 실패한다(오늘치는 아직 집계가 안 끝나 선택이 안 되는 걸로 보임, 실측 확인함) —
+    // 그래서 어제까지로 잡는다.
+    const end = new Date(Date.now() - 86400000);
+    const begin = new Date(end.getTime() - 6 * 86400000);
     fromDate = fmtDate(begin);
     toDate = fmtDate(end);
   }

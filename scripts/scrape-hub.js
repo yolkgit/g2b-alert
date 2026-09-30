@@ -248,17 +248,29 @@ async function shot(page, name) {
   try { await page.screenshot({ path: `hub-${name}.png` }); log(`   [shot] hub-${name}.png`); } catch {}
 }
 
-async function openReport(ctx) {
+async function openReportOnce(ctx) {
   const page = await ctx.newPage();
   const popupPromise = ctx.waitForEvent('page', { timeout: 45000 }).catch(() => null);
   await page.goto(LIST_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(5000);
-  await page.getByText('특정품목 조달 내역', { exact: true }).first().click({ timeout: 20000 });
+  await page.getByText('특정품목 조달 내역', { exact: true }).first().click({ timeout: 45000 });
   const popup = await popupPromise;
   const target = popup || page;
   await target.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
   await target.waitForTimeout(12000);
   return target;
+}
+
+// 리소스가 빠듯한 서버(특히 첫 실행)에서는 팝업 클릭이 타이밍상 한 번 실패할 수 있어(실측: 프로덕션
+// 서버에서 20초 안에 클릭이 안 끝남) 한 번 더 시도한다. 실패한 페이지는 닫고 새로 연다.
+async function openReport(ctx) {
+  try {
+    return await openReportOnce(ctx);
+  } catch (e) {
+    log(`   [재시도] 보고서 팝업 열기 실패(${e.message.slice(0, 100)}), 한 번 더 시도`);
+    for (const p of ctx.pages()) await p.close().catch(() => {});
+    return await openReportOnce(ctx);
+  }
 }
 
 // ── 기간 분할 ────────────────────────────────────────────────
@@ -349,11 +361,21 @@ function formFrame(target) {
 (async () => {
   const [code, from, to] = process.argv.slice(2);
   if (!code) { console.error('사용법: npm run scrape-hub -- <세부품명번호> [YYYYMMDD] [YYYYMMDD]'); process.exit(1); }
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const dFrom = from || today, dTo = to || today;
+  // 종료일을 오늘로 주면 달력에서 항상 하루 전으로 튕겨나가 조회가 실패한다(실측 확인) — 기본값은 어제.
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10).replace(/-/g, '');
+  const dFrom = from || yesterday, dTo = to || yesterday;
   log(`조회: 세부품명번호=${code}, 기간=${dFrom}~${dTo}`);
 
   const browser = await chromium.launch({ headless: true, ...launchOpts() });
+  try {
+    await runScrape(browser, code, dFrom, dTo, from, to);
+  } finally {
+    // 도중에 실패해도 chromium 프로세스가 서버에 계속 남아있으면 안 되므로(매일 자동 실행됨) 항상 닫는다.
+    await browser.close().catch(() => {});
+  }
+})().catch((e) => { console.error('ERROR:', e.message); process.exit(1); });
+
+async function runScrape(browser, code, dFrom, dTo, from, to) {
   const ctx = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: 'ko-KR', acceptDownloads: true });
 
   log('\n1. 보고서 팝업 열기...');
@@ -393,8 +415,7 @@ function formFrame(target) {
   if (!rowFound) {
     log('   ERROR: 선택 레이어 검색 결과가 비어 있음 (세부품명번호 확인 필요)');
     await shot(page, '3b-picker-empty');
-    await browser.close();
-    process.exit(1);
+    throw new Error('세부품명번호로 검색된 항목이 없음');
   }
   await form.click(sel(ID.pickRow0), { timeout: 10000 });
   await page.waitForTimeout(800);
@@ -462,6 +483,4 @@ function formFrame(target) {
     log('   저장: hub-result.json / hub-result.csv');
     saveToDb(rows);
   }
-
-  await browser.close();
-})().catch((e) => { console.error('ERROR:', e.message); process.exit(1); });
+}
