@@ -98,21 +98,14 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
     </div>
 
     <div class="card">
-      <h2>알림 받을 품목/지역 필터</h2>
-      <label>품목 검색으로 정확한 품명 찾기 (선택)</label>
+      <h2>알림 받을 품목/지역</h2>
       <div class="row">
-        <input id="item-search" placeholder="검색어 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
+        <input id="item-search" style="flex:2" placeholder="품목 검색 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
+        <input id="filter-region" style="flex:1" placeholder="지역(선택)">
         <button class="secondary" style="flex:none" onclick="searchItems()">검색</button>
       </div>
       <div id="item-search-err" class="err"></div>
-      <div id="item-search-results" style="margin-bottom:8px"></div>
-
-      <label>품목 키워드</label>
-      <div class="row">
-        <input id="filter-keyword" placeholder="품목 키워드 (예: 고상제설제, 위 검색으로 채우거나 직접 입력)" oninput="selectedItemCode=null">
-        <input id="filter-region" placeholder="지역 (비워두면 전국 전체 조회)">
-      </div>
-      <button onclick="addFilter()">필터 추가</button>
+      <div id="item-search-results"></div>
       <div id="filter-list" style="margin-top:10px"></div>
     </div>
 
@@ -265,8 +258,9 @@ async function saveServiceKey() {
   catch (e) { err.textContent = e.message; }
 }
 
-let selectedItemCode = null;
-
+// 검색 결과를 클릭하면 바로 그 자리에서 필터로 추가한다(예전엔 검색→클릭→키워드 입력칸에
+// 채워짐→별도 "필터 추가" 버튼까지 3단계였다). 서비스키가 없거나 검색 결과가 없을 때를 대비해
+// "검색 없이 그대로 추가" 버튼을 폴백으로 보여준다.
 async function searchItems() {
   const keyword = document.getElementById('item-search').value.trim();
   const err = document.getElementById('item-search-err');
@@ -277,24 +271,44 @@ async function searchItems() {
   try {
     const data = await api(`/api/item-lookup?keyword=${encodeURIComponent(keyword)}`);
     results.innerHTML = '';
-    if (!data.items.length) { results.innerHTML = '<div class="sub">검색 결과 없음</div>'; return; }
     for (const it of data.items) {
       const btn = document.createElement('button');
       btn.className = 'secondary';
       btn.style.cssText = 'display:block;width:100%;text-align:left;margin-bottom:4px';
       btn.textContent = (it.name || '(이름 없음)') + (it.code ? ` · ${it.code}` : '');
       if (it.desc) btn.title = it.desc;
-      btn.onclick = () => {
-        document.getElementById('filter-keyword').value = it.name || keyword;
-        selectedItemCode = it.code || null;
-        results.innerHTML = '';
-        document.getElementById('item-search').value = '';
-      };
+      btn.onclick = () => addFilterFromSearch(it.name || keyword, it.code || null);
       results.appendChild(btn);
     }
-  } catch (e) { err.textContent = e.message; results.innerHTML = ''; }
+    if (!data.items.length) addFallbackButton(keyword);
+  } catch (e) {
+    err.textContent = e.message;
+    addFallbackButton(keyword);
+  }
 }
 
+function addFallbackButton(keyword) {
+  const results = document.getElementById('item-search-results');
+  const btn = document.createElement('button');
+  btn.className = 'secondary';
+  btn.style.cssText = 'display:block;width:100%;text-align:left';
+  btn.textContent = `"${keyword}" 검색 없이 그대로 추가`;
+  btn.onclick = () => addFilterFromSearch(keyword, null);
+  results.appendChild(btn);
+}
+
+async function addFilterFromSearch(keyword, itemCode) {
+  const region = document.getElementById('filter-region').value.trim();
+  const err = document.getElementById('item-search-err');
+  err.textContent = '';
+  try {
+    await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region, itemCode }) });
+    document.getElementById('item-search').value = '';
+    document.getElementById('item-search-results').innerHTML = '';
+    await loadFilters();
+    renderContractTabs();
+  } catch (e) { err.textContent = e.message; }
+}
 
 let allFilters = [];
 
@@ -312,18 +326,6 @@ async function loadFilters() {
     div.appendChild(del);
     list.appendChild(div);
   }
-}
-
-async function addFilter() {
-  const keyword = document.getElementById('filter-keyword').value.trim();
-  const region = document.getElementById('filter-region').value.trim();
-  if (!keyword) return;
-  await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region, itemCode: selectedItemCode }) });
-  document.getElementById('filter-keyword').value = '';
-  document.getElementById('filter-region').value = '';
-  selectedItemCode = null;
-  await loadFilters();
-  renderContractTabs();
 }
 
 let activeFilterId = 'all';
