@@ -2,6 +2,7 @@ const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const cron = require('node-cron');
 const { spawn } = require('child_process');
 const webpush = require('web-push');
@@ -11,6 +12,7 @@ const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
 const app = express();
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db');
 const db = new Database(DB_PATH);
+db.pragma('foreign_keys = ON');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -51,10 +53,28 @@ db.exec(`
     to_date TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_hub_coverage_code ON hub_coverage (item_code);
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    alarm_time TEXT NOT NULL DEFAULT '07:00',
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 `);
 
 // filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
 try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
+// 사용자별 계정 도입 이전에 만들어진 filters/push_subscriptions에는 소유자가 없다 — 아래 admin
+// 마이그레이션이 기존 행들을 이 컬럼으로 이전한다.
+try { db.exec(`ALTER TABLE filters ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
+try { db.exec(`ALTER TABLE push_subscriptions ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
 
 // hub_coverage는 이 기능이 생기기 전부터 이미 hub_items에 쌓여 있던 자료를 모른다 — 그대로 두면
 // "조회" 버튼이 이미 가진 자료까지 전부 빠진 걸로 보고 다시 긁으려 든다. 커버리지가 비어 있는
@@ -82,6 +102,61 @@ function setSetting(key, value) {
               ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
 }
 
+// ─── 비밀번호 해싱 (내장 crypto만 사용, 새 의존성 없음) ──────────
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return `scrypt:${salt}:${crypto.scryptSync(pw, salt, 64).toString('hex')}`;
+}
+function verifyPassword(pw, stored) {
+  const [scheme, salt, hashHex] = (stored || '').split(':');
+  if (scheme !== 'scrypt' || !salt || !hashHex) return false;
+  const candidate = crypto.scryptSync(pw, salt, 64);
+  const expected = Buffer.from(hashHex, 'hex');
+  return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
+}
+
+// ─── 세션 (쿠키 값 = 랜덤 토큰, sessions 테이블에서 조회) ────────
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expires = new Date(now.getTime() + 365 * 86400000);
+  db.prepare(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
+    .run(token, userId, now.toISOString(), expires.toISOString());
+  return token;
+}
+function getSessionUser(req) {
+  const token = parseCookies(req).app_auth;
+  if (!token) return null;
+  return db.prepare(`
+    SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.token = ? AND s.expires_at > ?
+  `).get(token, new Date().toISOString()) || null;
+}
+function destroySession(req) {
+  const token = parseCookies(req).app_auth;
+  if (token) db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+}
+
+// ─── 레거시 단일 비밀번호 → admin 계정 마이그레이션 (1회성) ──────
+// 계정 도입 전 필터/구독이 이미 있었으면(=실제 운영 데이터), 그때 쓰던 공유 비밀번호를 그대로
+// 해싱해서 admin 계정을 만들고 기존 행들을 그 계정으로 이전한다. 진짜 빈 새 설치에서는(필터도
+// 구독도 0건) admin을 자동으로 만들지 않는다 — docker-compose 기본 비밀번호로 아무나 추측 가능한
+// admin 계정이 생기는 걸 막기 위함. users가 이미 있으면(=이미 마이그레이션 끝남) 아무것도 안 함.
+{
+  const userCount = db.prepare(`SELECT COUNT(*) c FROM users`).get().c;
+  const legacyPassword = getSetting('password');
+  const filterCount = db.prepare(`SELECT COUNT(*) c FROM filters`).get().c;
+  const subCount = db.prepare(`SELECT COUNT(*) c FROM push_subscriptions`).get().c;
+  if (userCount === 0 && legacyPassword && (filterCount > 0 || subCount > 0)) {
+    const legacyAlarmTime = getSetting('alarm_time', '07:00');
+    const info = db.prepare(`INSERT INTO users (username, password_hash, alarm_time, created_at) VALUES (?, ?, ?, ?)`)
+      .run('admin', hashPassword(legacyPassword), legacyAlarmTime, new Date().toISOString());
+    db.prepare(`UPDATE filters SET user_id = ? WHERE user_id IS NULL`).run(info.lastInsertRowid);
+    db.prepare(`UPDATE push_subscriptions SET user_id = ? WHERE user_id IS NULL`).run(info.lastInsertRowid);
+    console.log(`[migrate] admin 계정 생성, 필터 ${filterCount}건·구독 ${subCount}건 이전, alarm_time=${legacyAlarmTime}`);
+  }
+}
+
 const ENV_PASSWORD = process.env.APP_PASSWORD || 'g2balert2026';
 if (!getSetting('password')) setSetting('password', ENV_PASSWORD);
 
@@ -102,30 +177,59 @@ webpush.setVapidDetails(
 
 app.use(express.json({ limit: '2mb' }));
 
-// ─── 접속 비밀번호 인증 (쿠키 기반) ──────────────────────────
-function getPassword() { return getSetting('password', ENV_PASSWORD); }
-function getAuthToken(pw) { return 'auth_' + Buffer.from(pw).toString('base64'); }
+// ─── 계정 인증 (아이디+비밀번호, 세션 쿠키) ──────────────────
 function parseCookies(req) {
   const out = {}; const h = req.headers.cookie || '';
   h.split(';').forEach((p) => { const i = p.indexOf('='); if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); });
   return out;
 }
-function isAuthed(req) { return parseCookies(req).app_auth === getAuthToken(getPassword()); }
+function setSessionCookie(res, token) {
+  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(token)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+}
 
 app.post('/api/login', (req, res) => {
-  const { password } = req.body || {};
-  if (password !== getPassword()) return res.status(401).json({ error: '비밀번호가 틀렸습니다' });
-  res.cookie ? null : null;
-  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(getAuthToken(password))}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+  const { username, password } = req.body || {};
+  const user = db.prepare(`SELECT * FROM users WHERE username = ?`).get((username || '').trim());
+  if (!user || !verifyPassword(password || '', user.password_hash)) {
+    return res.status(401).json({ error: '아이디 또는 비밀번호가 틀렸습니다' });
+  }
+  setSessionCookie(res, createSession(user.id));
+  res.json({ ok: true, username: user.username });
+});
+
+app.post('/api/register', (req, res) => {
+  const { username, password } = req.body || {};
+  const uname = (username || '').trim();
+  if (!uname || uname.length < 3) return res.status(400).json({ error: '아이디는 3자 이상이어야 합니다' });
+  if (!/^[a-zA-Z0-9_-]+$/.test(uname)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 만 가능합니다' });
+  if (!password || password.length < 4) return res.status(400).json({ error: '비밀번호는 4자 이상이어야 합니다' });
+  if (db.prepare(`SELECT id FROM users WHERE username = ?`).get(uname)) {
+    return res.status(409).json({ error: '이미 사용 중인 아이디입니다' });
+  }
+  const info = db.prepare(`INSERT INTO users (username, password_hash, alarm_time, created_at) VALUES (?, ?, ?, ?)`)
+    .run(uname, hashPassword(password), '07:00', new Date().toISOString());
+  setSessionCookie(res, createSession(info.lastInsertRowid));
+  res.json({ ok: true, username: uname });
+});
+
+app.post('/api/logout', (req, res) => {
+  destroySession(req);
+  res.setHeader('Set-Cookie', `app_auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
   res.json({ ok: true });
 });
-app.get('/api/session', (req, res) => res.json({ authed: isAuthed(req) }));
+
+app.get('/api/session', (req, res) => {
+  const user = getSessionUser(req);
+  res.json({ authed: !!user, username: user ? user.username : null });
+});
 
 app.use((req, res, next) => {
-  const openPaths = ['/api/login', '/api/session', '/manifest.json', '/sw.js', '/login.html'];
+  const openPaths = ['/api/login', '/api/register', '/api/session', '/manifest.json', '/sw.js', '/login.html'];
   if (openPaths.includes(req.path) || req.path.startsWith('/icons/')) return next();
   if (req.path.startsWith('/api/')) {
-    if (!isAuthed(req)) return res.status(401).json({ error: '로그인이 필요합니다' });
+    const user = getSessionUser(req);
+    if (!user) return res.status(401).json({ error: '로그인이 필요합니다' });
+    req.user = user;
     return next();
   }
   next();
@@ -136,7 +240,7 @@ app.get('/api/settings', (req, res) => {
   res.json({
     hasServiceKey: !!getSetting('g2b_service_key'),
     vapidPublicKey: getSetting('vapid_public'),
-    alarmTime: getSetting('alarm_time', '07:00'),
+    alarmTime: req.user.alarm_time,
     lastHubAt: getSetting('last_hub_at'),
     lastHubSummary: getSetting('last_hub_summary'),
   });
@@ -151,15 +255,14 @@ app.post('/api/settings/service-key', (req, res) => {
 app.post('/api/settings/password', (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (!currentPassword || !newPassword) return res.status(400).json({ error: '현재 비밀번호와 새 비밀번호를 모두 입력하세요' });
-  if (currentPassword !== getPassword()) return res.status(401).json({ error: '현재 비밀번호가 틀렸습니다' });
+  if (!verifyPassword(currentPassword, req.user.password_hash)) return res.status(401).json({ error: '현재 비밀번호가 틀렸습니다' });
   if (newPassword.length < 4) return res.status(400).json({ error: '새 비밀번호는 4자 이상이어야 합니다' });
-  setSetting('password', newPassword);
-  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(getAuthToken(newPassword))}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+  db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashPassword(newPassword), req.user.id);
   res.json({ ok: true });
 });
 
 app.get('/api/filters', (req, res) => {
-  res.json(db.prepare(`SELECT * FROM filters ORDER BY id DESC`).all());
+  res.json(db.prepare(`SELECT * FROM filters WHERE user_id = ? ORDER BY id DESC`).all(req.user.id));
 });
 
 app.get('/api/item-lookup', async (req, res) => {
@@ -178,12 +281,13 @@ app.get('/api/item-lookup', async (req, res) => {
 app.post('/api/filters', (req, res) => {
   const { keyword, region, itemCode } = req.body || {};
   if (!keyword || !keyword.trim()) return res.status(400).json({ error: 'keyword 필요' });
-  const info = db.prepare(`INSERT INTO filters (keyword, region, item_code, created_at) VALUES (?, ?, ?, ?)`)
-    .run(keyword.trim(), (region || '').trim() || null, (itemCode || '').trim() || null, new Date().toISOString());
+  const info = db.prepare(`INSERT INTO filters (user_id, keyword, region, item_code, created_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(req.user.id, keyword.trim(), (region || '').trim() || null, (itemCode || '').trim() || null, new Date().toISOString());
   res.json({ id: info.lastInsertRowid });
 });
 app.delete('/api/filters/:id', (req, res) => {
-  db.prepare(`DELETE FROM filters WHERE id = ?`).run(req.params.id);
+  const info = db.prepare(`DELETE FROM filters WHERE id = ? AND user_id = ?`).run(req.params.id, req.user.id);
+  if (!info.changes) return res.status(404).json({ error: '필터를 찾을 수 없습니다' });
   res.json({ ok: true });
 });
 
@@ -191,19 +295,21 @@ app.delete('/api/filters/:id', (req, res) => {
 app.post('/api/push/subscribe', (req, res) => {
   const sub = req.body || {};
   if (!sub.endpoint || !sub.keys) return res.status(400).json({ error: 'subscription 형식 오류' });
-  db.prepare(`INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?)
-              ON CONFLICT(endpoint) DO NOTHING`)
-    .run(sub.endpoint, sub.keys.p256dh, sub.keys.auth, new Date().toISOString());
+  // 같은 endpoint(=같은 브라우저/기기)가 다른 계정으로 재구독되면 소유자를 그 계정으로 옮긴다
+  // (기기 재로그인 시나리오 — 알림은 "지금 그 기기에 로그인된 사람"에게 가는 게 맞음).
+  db.prepare(`INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`)
+    .run(req.user.id, sub.endpoint, sub.keys.p256dh, sub.keys.auth, new Date().toISOString());
   res.json({ ok: true });
 });
 app.delete('/api/push/subscribe', (req, res) => {
   const { endpoint } = req.body || {};
-  db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`).run(endpoint);
+  db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`).run(endpoint, req.user.id);
   res.json({ ok: true });
 });
 
-async function sendPushToAll(payload) {
-  const subs = db.prepare(`SELECT * FROM push_subscriptions`).all();
+async function sendPushToUser(userId, payload) {
+  const subs = db.prepare(`SELECT * FROM push_subscriptions WHERE user_id = ?`).all(userId);
   const body = JSON.stringify(payload);
   for (const sub of subs) {
     try {
@@ -298,8 +404,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.post('/api/settings/alarm-time', (req, res) => {
   const { time } = req.body || {};
   if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(time || '')) return res.status(400).json({ error: '시간 형식이 올바르지 않습니다 (HH:MM)' });
-  setSetting('alarm_time', time);
-  scheduleHubScrape(time);
+  db.prepare(`UPDATE users SET alarm_time = ? WHERE id = ?`).run(time, req.user.id);
+  rescheduleAllAlarms();
   res.json({ ok: true });
 });
 
@@ -381,57 +487,86 @@ async function fillMissingItemCodes() {
   }
 }
 
-// 등록된 필터 중 세부품명번호가 있는 것만 수집한다(번호가 없으면 허브 조회가 불가능).
-// 기간을 안 주면 최근 7일치를 본다 — 오늘 하루만 보면 아직 계약이 안 올라와 0건이 되기 쉽다.
-async function runHubScrapeAll({ fromDate, toDate } = {}) {
-  if (!fromDate || !toDate) {
-    // 종료일을 오늘로 주면 조달데이터허브 달력에서 항상 하루 전으로 튕겨나가 조회 자체가
-    // 실패한다(오늘치는 아직 집계가 안 끝나 선택이 안 되는 걸로 보임, 실측 확인함) —
-    // 그래서 어제까지로 잡는다.
-    const end = new Date(Date.now() - 86400000);
-    const begin = new Date(end.getTime() - 6 * 86400000);
-    fromDate = fmtDate(begin);
-    toDate = fmtDate(end);
+// 종료일을 오늘로 주면 조달데이터허브 달력에서 항상 하루 전으로 튕겨나가 조회 자체가 실패한다
+// (오늘치는 아직 집계가 안 끝나 선택이 안 되는 걸로 보임, 실측 확인함) — 그래서 어제까지로 잡는다.
+function defaultScrapeWindow() {
+  const end = new Date(Date.now() - 86400000);
+  const begin = new Date(end.getTime() - 6 * 86400000);
+  return { fromDate: fmtDate(begin), toDate: fmtDate(end) };
+}
+
+// hub_items에 처음 들어간(=진짜 신규) 행이라도, 계약일자가 오래된 과거 건이면(예: 과거 날짜를
+// 수동 조회하다 우연히 처음 긁힌 경우) "신규 계약" 알림 대상에서 뺀다 — 매일 알림은 "당일 새로
+// 올라온 것"을 알리는 용도이지, DB에 언제 들어왔는지는 사용자와 상관없는 내부 사정이라서.
+const NOTIFY_RECENT_DAYS = 3;
+function isRecentEnoughToNotify(row) {
+  const d = row['계약(납품요구)일자'];
+  if (!d || !/^\d{8}$/.test(d)) return false;
+  const cutoff = fmtDate(new Date(Date.now() - NOTIFY_RECENT_DAYS * 86400000));
+  return d >= cutoff;
+}
+
+// item_code 하나를 긁어서, 이번에 새로 발견된(hub_items PK 기준) 행 중 최근 것만 그 품목을
+// 보는 모든 사용자에게 알린다 — 트리거(크론이든 수동 조회든)와 무관하게 항상 같은 규칙 적용.
+// hub_items는 PK로 중복 제거되므로 "신규"는 딱 한 번만 감지된다 — 그 순간 알림을 안 보내면
+// 그 품목을 보는 다른 사용자는 영영 못 받으므로, 트리거한 사람만이 아니라 전원에게 보낸다.
+async function notifyAllUsersForCode(itemCode, rows) {
+  const recent = rows.filter(isRecentEnoughToNotify);
+  if (!recent.length) return;
+  const filters = db.prepare(`SELECT * FROM filters WHERE item_code = ?`).all(itemCode);
+  const byUser = new Map();
+  for (const f of filters) if (!byUser.has(f.user_id)) byUser.set(f.user_id, f);
+  if (!byUser.size) return;
+  const top = recent.slice(0, 3)
+    .map((r) => `${r['품목명'] || itemCode} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? Number(r['계약납품단가']).toLocaleString() + '원' : ''}`)
+    .join('\n');
+  for (const [userId, f] of byUser) {
+    await sendPushToUser(userId, {
+      title: `나라장터 신규 계약 ${recent.length}건 - ${f.keyword}`,
+      body: top,
+      url: '/',
+    });
   }
+}
+
+// item_code 목록을 하나씩(중복 없이) 긁는다 — 여러 사용자가 같은 품목을 봐도 한 번만 스크래핑.
+async function scrapeCodesAndNotify(codes, { fromDate, toDate }) {
+  const results = [];
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    hubState = { status: 'running', progress: `${i + 1}/${codes.length} ${code} 수집 중...`, percent: stepPercent(i, codes.length), error: null };
+    const r = await runHubScrape(code, fromDate, toDate, (step, label) => {
+      hubState = { status: 'running', progress: `${i + 1}/${codes.length} ${code} — ${label}`, percent: stepPercent(i, codes.length, step), error: null };
+    });
+    results.push({ code, ...r });
+    if (r.exitCode !== 0) console.error(`[hub] ${code} 실패:\n${r.tail.slice(-600)}`);
+    else mergeCoverage(code, fromDate, toDate);
+    if (r.newRows && r.newRows.length) await notifyAllUsersForCode(code, r.newRows);
+  }
+  return results;
+}
+
+// 특정 alarm_time을 가진 사용자들의 필터에서(중복 제거된) item_code만 뽑아 수집한다.
+// 크론 틱 하나당 한 번 호출됨 — "그 시간을 등록한 사용자들이 보는 품목만" 긁는다.
+async function runHubScrapeForTime(time) {
+  const { fromDate, toDate } = defaultScrapeWindow();
   // item_code 컬럼이 생기기 전에 만든 필터는 번호가 비어 있다. 키워드로 물품목록 API를 조회해
   // 이름이 정확히 일치하는 세부품명이 있으면 자동으로 채운다(사용자가 다시 등록할 필요 없게).
   await fillMissingItemCodes();
 
-  const filters = db.prepare(`SELECT * FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all();
-  if (!filters.length) {
-    hubState = { status: 'error', progress: '', percent: 0, error: '세부품명번호를 확인할 수 없습니다. 필터의 품목명이 정확한지(예: 고상제설제) 확인하거나, 품목 검색으로 다시 추가해 주세요.' };
+  const codes = db.prepare(`
+    SELECT DISTINCT f.item_code FROM filters f JOIN users u ON u.id = f.user_id
+    WHERE u.alarm_time = ? AND f.item_code IS NOT NULL AND f.item_code <> ''
+  `).all(time).map((r) => r.item_code);
+  if (!codes.length) {
+    hubState = { status: 'done', progress: `${time}에 등록된 품목 없음`, percent: 100, error: null };
     return;
   }
-  const done = [];
-  for (let i = 0; i < filters.length; i++) {
-    const f = filters[i];
-    hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) 수집 중...`, percent: stepPercent(i, filters.length), error: null };
-    const r = await runHubScrape(f.item_code, fromDate, toDate, (step, label) => {
-      hubState = { status: 'running', progress: `${i + 1}/${filters.length} ${f.keyword}(${f.item_code}) — ${label}`, percent: stepPercent(i, filters.length, step), error: null };
-    });
-    done.push(`${f.keyword} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`);
-    if (r.exitCode !== 0) console.error(`[hub] ${f.keyword} 실패:\n${r.tail.slice(-600)}`);
-    else mergeCoverage(f.item_code, fromDate, toDate);
-    if (r.newRows && r.newRows.length) await notifyNewHubRows(f, r.newRows);
-  }
-  const summary = `${new Date().toLocaleString('ko-KR')} · ${done.join(', ')}`;
+  const results = await scrapeCodesAndNotify(codes, { fromDate, toDate });
+  const summary = `${new Date().toLocaleString('ko-KR')} · ${results.map((r) => `${r.code} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`).join(', ')}`;
   setSetting('last_hub_at', new Date().toISOString());
   setSetting('last_hub_summary', summary);
   hubState = { status: 'done', progress: summary, percent: 100, error: null };
-}
-
-// 이번 수집에서 새로 발견된(=hub_items에 처음 들어간) 라인아이템을 필터별로 알림 보낸다.
-// hub_items의 PK(계약번호+변경차수+물품순번)가 그대로 "이미 알렸는지" 판단 기준이라 별도
-// dedup 테이블이 필요 없다 — 다음 수집에서 같은 항목은 다시 신규로 잡히지 않는다.
-async function notifyNewHubRows(filter, rows) {
-  const top = rows.slice(0, 3)
-    .map((r) => `${r['품목명'] || filter.keyword} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? Number(r['계약납품단가']).toLocaleString() + '원' : ''}`)
-    .join('\n');
-  await sendPushToAll({
-    title: `나라장터 신규 계약 ${rows.length}건 - ${filter.keyword}`,
-    body: top,
-    url: '/',
-  });
 }
 
 // 상태 조회만 남긴다 — 수동 "지금 확인하기" 버튼은 없앴고(매일 자동 실행으로 충분, 표의
@@ -448,7 +583,8 @@ app.post('/api/hub-query', (req, res) => {
   }
   const codes = itemCode
     ? [itemCode]
-    : db.prepare(`SELECT DISTINCT item_code FROM filters WHERE item_code IS NOT NULL AND item_code <> ''`).all().map((r) => r.item_code);
+    // "전체" 탭 조회는 내 필터만 대상으로 한다 — 다른 사용자가 보는 품목까지 긁을 필요 없음.
+    : db.prepare(`SELECT DISTINCT item_code FROM filters WHERE user_id = ? AND item_code IS NOT NULL AND item_code <> ''`).all(req.user.id).map((r) => r.item_code);
   if (!codes.length) return res.status(400).json({ error: '조회할 품목이 없습니다' });
 
   const gaps = [];
@@ -467,6 +603,9 @@ app.post('/api/hub-query', (req, res) => {
       });
       if (r.exitCode === 0) mergeCoverage(code, gFrom, gTo);
       else console.error(`[hub-query] ${code} (${gFrom}~${gTo}) 실패:\n${r.tail.slice(-600)}`);
+      // 수동 조회라도 "신규 계약"으로 잡힌 게 있으면(당일치만) 그 품목을 보는 모든 사용자에게
+      // 알린다 — 과거 날짜 브라우징은 notifyAllUsersForCode 안의 당일 필터가 걸러준다.
+      if (r.exitCode === 0 && r.newRows && r.newRows.length) await notifyAllUsersForCode(code, r.newRows);
     }
     hubState = { status: 'done', progress: '조회 완료', percent: 100, error: null };
   })().catch((e) => { hubState = { status: 'error', progress: '', percent: 0, error: e.message }; });
@@ -474,17 +613,22 @@ app.post('/api/hub-query', (req, res) => {
   res.json({ needsScrape: true, started: true });
 });
 
-// 설정된 알림 시간에 허브 수집을 돌린다 — 이게 곧 매일 알림이다(신규 항목이 있으면 푸시 발송).
-let hubTask = null;
-function scheduleHubScrape(time) {
-  if (hubTask) hubTask.stop();
-  const [hh, mm] = time.split(':').map(Number);
-  hubTask = cron.schedule(`${mm} ${hh} * * *`, () => {
-    if (hubState.status === 'running') return;
-    runHubScrapeAll().catch((e) => console.error('hub scrape failed:', e.message));
-  }, { timezone: 'Asia/Seoul' });
+// 사용자마다 다른 alarm_time을 가질 수 있어, 실제로 쓰이는 시간마다 크론 job을 하나씩 띄운다.
+// 알림 시간 저장 시(POST /api/settings/alarm-time)마다, 그리고 서버 부팅 시 1번 호출된다.
+let hubTasks = new Map();
+function rescheduleAllAlarms() {
+  for (const t of hubTasks.values()) t.stop();
+  hubTasks.clear();
+  const times = db.prepare(`SELECT DISTINCT alarm_time FROM users`).all().map((r) => r.alarm_time);
+  for (const time of times) {
+    const [hh, mm] = time.split(':').map(Number);
+    hubTasks.set(time, cron.schedule(`${mm} ${hh} * * *`, () => {
+      if (hubState.status === 'running') return;
+      runHubScrapeForTime(time).catch((e) => console.error('hub scrape failed:', e.message));
+    }, { timezone: 'Asia/Seoul' }));
+  }
 }
-scheduleHubScrape(getSetting('alarm_time', '07:00'));
+rescheduleAllAlarms();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));

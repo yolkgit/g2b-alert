@@ -5,48 +5,68 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>나라장터 특정품목 알림</title>
 <link rel="manifest" href="/manifest.json">
-<meta name="theme-color" content="#1c3f6e">
+<meta name="theme-color" content="#18181b">
 <link rel="icon" href="/icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-*{box-sizing:border-box;margin:0;font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif}
-body{background:#eef1f5;color:#222;min-height:100vh}
+:root{
+  --background:#fff; --foreground:#18181b; --muted:#f4f4f5; --muted-foreground:#71717a;
+  --border:#e4e4e7; --card:#fff; --primary:#18181b; --primary-foreground:#fafafa;
+  --secondary:#fff; --secondary-foreground:#18181b; --destructive:#dc2626;
+  --ring:#18181b; --radius:0.5rem;
+  --shadow-sm:0 1px 2px 0 rgb(0 0 0 / .05); --shadow:0 1px 3px 0 rgb(0 0 0 / .1), 0 1px 2px -1px rgb(0 0 0 / .1);
+  --success:#16a34a; --success-bg:#f0fdf4; --success-border:#bbf7d0;
+  --warn:#dc2626; --warn-bg:#fef2f2; --warn-border:#fecaca;
+}
+*{box-sizing:border-box;margin:0;font-family:'Inter','Malgun Gothic','맑은 고딕','Segoe UI',sans-serif}
+body{background:var(--muted);color:var(--foreground);min-height:100vh}
 .wrap{max-width:960px;margin:0 auto;padding:16px}
-h1{font-size:18px;font-weight:800;color:#1c3f6e;margin-bottom:2px}
-.sub{font-size:12px;color:#666;margin-bottom:16px}
-.card{background:#fff;border:1px solid #d3d9e0;border-radius:4px;padding:16px;margin-bottom:14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.card h2{font-size:14px;font-weight:800;color:#1c3f6e;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid #1c3f6e;display:flex;align-items:center;gap:6px}
-label{font-size:12px;color:#666;display:block;margin-bottom:4px}
-input,select{width:100%;background:#fff;border:1px solid #b8c0cc;border-radius:3px;color:#222;padding:9px 10px;font-size:13px;outline:none;margin-bottom:8px}
-input:focus{border-color:#1c3f6e}
-button{background:#1c3f6e;border:1px solid #1c3f6e;border-radius:3px;color:#fff;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer}
-button.secondary{background:#fff;color:#1c3f6e;border:1px solid #1c3f6e}
-button.danger{background:#fff;color:#c0392b;border:1px solid #c0392b}
+h1{font-size:18px;font-weight:700;color:var(--foreground);margin-bottom:2px}
+.sub{font-size:12px;color:var(--muted-foreground);margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-sm)}
+.card h2{font-size:14px;font-weight:600;color:var(--foreground);margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px}
+label{font-size:12px;color:var(--muted-foreground);display:block;margin-bottom:4px}
+input,select{width:100%;background:var(--background);border:1px solid var(--border);border-radius:calc(var(--radius) - 2px);color:var(--foreground);padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus{border-color:var(--ring);box-shadow:0 0 0 3px rgb(24 24 27 / .08)}
+button{background:var(--primary);border:1px solid var(--primary);border-radius:calc(var(--radius) - 2px);color:var(--primary-foreground);padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer;transition:opacity .15s}
+button:hover{opacity:.9}
+button.secondary{background:var(--secondary);color:var(--secondary-foreground);border:1px solid var(--border)}
+button.danger{background:var(--background);color:var(--destructive);border:1px solid var(--destructive)}
 button:disabled{opacity:.5;cursor:not-allowed}
+a{color:var(--foreground);text-decoration:underline;text-underline-offset:2px;font-weight:500}
 .row{display:flex;gap:8px}
 .row>*{flex:1}
-.pill{display:inline-block;background:#eef1f5;border:1px solid #b8c0cc;border-radius:3px;padding:2px 8px;font-size:11px;color:#555}
-.pill.ok{color:#1a7f37;border-color:#1a7f3755;background:#eaf7ee}
-.pill.warn{color:#c0392b;border-color:#c0392b55;background:#fdeeec}
-.filter-item{border-top:1px solid #e5e8ec;padding:8px 0;font-size:13px;display:flex;justify-content:space-between;align-items:center}
+.pill{display:inline-block;background:var(--muted);border:1px solid var(--border);border-radius:999px;padding:2px 10px;font-size:11px;font-weight:500;color:var(--muted-foreground)}
+.pill.ok{color:var(--success);border-color:var(--success-border);background:var(--success-bg)}
+.pill.warn{color:var(--warn);border-color:var(--warn-border);background:var(--warn-bg)}
+.filter-item{border-top:1px solid var(--border);padding:8px 0;font-size:13px;display:flex;justify-content:space-between;align-items:center}
 .filter-item:first-child{border-top:none}
 .tabs{display:flex;gap:4px;overflow-x:auto;margin-bottom:10px;padding-bottom:2px}
-.tabs button{flex:none;background:#f0f3f7;color:#1c3f6e;border:1px solid #b8c0cc;font-size:12px;padding:6px 12px;white-space:nowrap}
-.tabs button.active{background:#1c3f6e;color:#fff;border-color:#1c3f6e}
+.tabs button{flex:none;background:var(--background);color:var(--muted-foreground);border:1px solid var(--border);font-size:12px;padding:6px 14px;white-space:nowrap;border-radius:calc(var(--radius) - 2px);font-weight:500}
+.tabs button.active{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
 table{width:100%;border-collapse:collapse;font-size:12px}
-thead th{background:#1c3f6e;color:#fff;font-weight:700;padding:8px 6px;border:1px solid #16335c;white-space:nowrap;text-align:center}
-tbody td{padding:7px 6px;border:1px solid #dde2e8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
-tbody tr:nth-child(even){background:#f7f9fc}
-tbody tr:hover{background:#eaf0fa}
-td.num{text-align:right;color:#1a56b8;font-variant-numeric:tabular-nums}
+thead th{background:transparent;color:var(--muted-foreground);font-weight:500;padding:8px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;text-align:left}
+tbody td{padding:10px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+tbody tr:hover{background:var(--muted)}
+td.num{text-align:right;color:var(--foreground);font-variant-numeric:tabular-nums}
 td.center{text-align:center}
 .table-scroll{overflow-x:auto}
-pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
-.err{color:#c0392b;font-size:12px;margin:6px 0}
-.msg{color:#1a7f37;font-size:12px;margin:6px 0}
-#login-view{height:100vh;display:flex;align-items:center;justify-content:center;background:#eef1f5}
-.login-box{background:#fff;border:1px solid #d3d9e0;border-radius:4px;padding:34px 28px;width:320px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+pre{background:var(--muted);border:1px solid var(--border);border-radius:calc(var(--radius) - 2px);padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
+.err{color:var(--destructive);font-size:12px;margin:6px 0}
+.msg{color:var(--success);font-size:12px;margin:6px 0}
+#login-view{height:100vh;display:flex;align-items:center;justify-content:center;background:var(--muted)}
+.login-box{background:var(--card);border:1px solid var(--border);border-radius:calc(var(--radius) + 4px);padding:36px 32px;width:340px;text-align:center;box-shadow:var(--shadow)}
 .login-box .logo{font-size:34px;margin-bottom:6px}
 #main-view{display:none}
+.topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:16px}
+.topbar h1{margin-bottom:0}
+.topbar-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+@media (max-width:480px){
+  .topbar h1{font-size:15px;flex-basis:100%}
+  .topbar-actions{justify-content:flex-end;flex-basis:100%}
+}
 </style>
 </head>
 <body>
@@ -55,20 +75,26 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
   <div class="login-box">
     <div class="logo">🔔</div>
     <h1>나라장터 알림</h1>
-    <p class="sub">접속하려면 비밀번호를 입력하세요</p>
+    <p class="sub" id="auth-mode-sub">로그인하세요</p>
     <div class="err" id="login-err"></div>
-    <input type="password" id="pw" placeholder="비밀번호" autofocus onkeydown="if(event.key==='Enter')login()">
-    <button style="width:100%" onclick="login()">로그인</button>
+    <input type="text" id="username" placeholder="아이디" autofocus autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('pw').focus()">
+    <input type="password" id="pw" placeholder="비밀번호" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitAuth()">
+    <button style="width:100%" onclick="submitAuth()" id="auth-submit-btn">로그인</button>
+    <p class="sub" style="margin-top:12px;margin-bottom:0">
+      <a href="#" onclick="toggleAuthMode();return false" id="auth-toggle-link">계정이 없으신가요? 회원가입</a>
+    </p>
   </div>
 </div>
 
 <div id="main-view">
   <div class="wrap">
-    <div style="display:flex;justify-content:space-between;align-items:center">
+    <div class="topbar">
       <h1>🔔 나라장터 특정품목 알림</h1>
-      <div style="display:flex;gap:6px;flex:none">
+      <div class="topbar-actions">
+        <span class="sub" id="whoami" style="flex:none;margin-bottom:0"></span>
         <button class="secondary" style="flex:none" onclick="toggleNotifyPanel()">🔔 알림</button>
         <button class="secondary" style="flex:none" onclick="toggleSettings()">⚙️ 설정</button>
+        <button class="secondary" style="flex:none" onclick="logout()">로그아웃</button>
       </div>
     </div>
     <div class="sub" id="last-run-sub">불러오는 중...</div>
@@ -154,22 +180,39 @@ async function api(path, opts) {
   return data;
 }
 
-async function login() {
-  const pw = document.getElementById('pw').value;
+let authMode = 'login'; // 'login' | 'register'
+
+function toggleAuthMode() {
+  authMode = authMode === 'login' ? 'register' : 'login';
+  document.getElementById('auth-mode-sub').textContent = authMode === 'login' ? '로그인하세요' : '새 계정을 만드세요';
+  document.getElementById('auth-submit-btn').textContent = authMode === 'login' ? '로그인' : '회원가입';
+  document.getElementById('auth-toggle-link').textContent = authMode === 'login' ? '계정이 없으신가요? 회원가입' : '이미 계정이 있으신가요? 로그인';
   document.getElementById('login-err').textContent = '';
+}
+
+async function submitAuth() {
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('pw').value;
+  const err = document.getElementById('login-err');
+  err.textContent = '';
+  const endpoint = authMode === 'login' ? '/api/login' : '/api/register';
   try {
-    await api('/api/login', { method: 'POST', body: JSON.stringify({ password: pw }) });
+    await api(endpoint, { method: 'POST', body: JSON.stringify({ username, password }) });
     boot();
-  } catch (err) {
-    document.getElementById('login-err').textContent = err.message;
-  }
+  } catch (e) { err.textContent = e.message; }
+}
+
+async function logout() {
+  await api('/api/logout', { method: 'POST' }).catch(() => {});
+  boot();
 }
 
 async function boot() {
-  const { authed } = await api('/api/session');
+  const { authed, username } = await api('/api/session');
   document.getElementById('login-view').style.display = authed ? 'none' : 'flex';
   document.getElementById('main-view').style.display = authed ? 'block' : 'none';
   if (authed) {
+    document.getElementById('whoami').textContent = username ? `${username}님` : '';
     initQueryDates();
     await loadSettings(); await loadFilters(); await loadContracts();
   }
