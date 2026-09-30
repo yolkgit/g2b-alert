@@ -66,23 +66,28 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
   <div class="wrap">
     <div style="display:flex;justify-content:space-between;align-items:center">
       <h1>🔔 나라장터 특정품목 알림</h1>
-      <button class="secondary" style="flex:none" onclick="toggleSettings()">⚙️ 설정</button>
+      <div style="display:flex;gap:6px;flex:none">
+        <button class="secondary" style="flex:none" onclick="toggleNotifyPanel()">🔔 알림</button>
+        <button class="secondary" style="flex:none" onclick="toggleSettings()">⚙️ 설정</button>
+      </div>
     </div>
     <div class="sub" id="last-run-sub">불러오는 중...</div>
 
-    <div class="card" id="settings-panel" style="display:none">
-      <h2>매일 알림 시간</h2>
-      <div class="sub" id="hub-sub">아직 실행한 적 없음</div>
-      <div class="row">
+    <div class="card" id="notify-panel" style="display:none">
+      <h2>알림</h2>
+      <button class="secondary" onclick="enablePush()" id="push-btn">홈화면 알림 켜기</button>
+      <div class="sub" id="hub-sub" style="margin-top:8px">아직 실행한 적 없음</div>
+      <div class="row" style="margin-top:6px">
         <input type="time" id="alarm-time">
         <button style="flex:none" onclick="saveAlarmTime()">저장</button>
       </div>
       <div class="err" id="alarm-time-err"></div>
       <div class="msg" id="alarm-time-msg"></div>
       <div class="sub" style="margin-top:6px">이 시간에 등록된 품목을 자동으로 조회하고, 신규 계약이 있으면 푸시로 알립니다.</div>
-      <button class="secondary" style="margin-top:8px" onclick="enablePush()" id="push-btn">홈화면 알림 켜기</button>
+    </div>
 
-      <h2 style="margin-top:16px">data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
+    <div class="card" id="settings-panel" style="display:none">
+      <h2>data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
       <label>공공데이터포털에서 발급받은 "조달청_물품목록정보서비스" 인증키(Decoding) — 품목 검색에 쓰입니다</label>
       <input type="password" id="service-key" placeholder="서비스키 입력">
       <button onclick="saveServiceKey()">저장</button>
@@ -200,6 +205,11 @@ async function loadSettings() {
 
 function toggleSettings() {
   const el = document.getElementById('settings-panel');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function toggleNotifyPanel() {
+  const el = document.getElementById('notify-panel');
   el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
