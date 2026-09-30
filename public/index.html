@@ -80,14 +80,10 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
       <div class="msg" id="alarm-time-msg"></div>
 
       <h2 style="margin-top:16px">data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
-      <label>공공데이터포털에서 발급받은 "나라장터 계약정보서비스" 인증키(Decoding)</label>
+      <label>공공데이터포털에서 발급받은 "조달청_물품목록정보서비스" 인증키(Decoding) — 품목 검색에 쓰입니다</label>
       <input type="password" id="service-key" placeholder="서비스키 입력">
-      <div class="row">
-        <button onclick="saveServiceKey()">저장</button>
-        <button class="secondary" onclick="testFetch()">테스트 조회(원본 확인)</button>
-      </div>
+      <button onclick="saveServiceKey()">저장</button>
       <div class="err" id="key-err"></div>
-      <pre id="test-result" style="display:none"></pre>
 
       <h2 style="margin-top:16px">비밀번호 변경</h2>
       <input type="password" id="current-password" placeholder="현재 비밀번호">
@@ -100,27 +96,12 @@ pre{background:#f4f6f9;border:1px solid #d3d9e0;border-radius:3px;padding:10px;f
 
     <div class="card">
       <h2>지금 확인하기</h2>
+      <div class="sub" id="hub-sub">아직 실행한 적 없음</div>
       <div class="row">
-        <button onclick="checkNow()" id="check-now-btn">지금 계약 조회</button>
+        <button onclick="startHubScrape()" id="hub-btn">지금 계약 조회</button>
         <button class="secondary" onclick="enablePush()" id="push-btn">홈화면 알림 켜기</button>
       </div>
-      <div class="err" id="check-err"></div>
-      <div class="msg" id="check-msg"></div>
-    </div>
-
-    <div class="card">
-      <h2>과거 내역 불러오기</h2>
-      <div class="sub" id="backfill-sub">아직 실행한 적 없음</div>
-      <button class="secondary" onclick="startBackfill()" id="backfill-btn">2026년 전체 내역 불러오기</button>
-      <div class="sub" style="margin-top:6px">한 번 돌리면 API 호출을 많이 써서(구간을 나눠 순차 조회) 몇 분 걸릴 수 있습니다. 알림은 안 가고, 매칭된 것만 저장돼서 아래 표에서 볼 수 있습니다.</div>
-      <div class="err" id="backfill-err"></div>
-    </div>
-
-    <div class="card">
-      <h2>단가·수량 수집 (조달데이터허브)</h2>
-      <div class="sub" id="hub-sub">아직 실행한 적 없음</div>
-      <button class="secondary" onclick="startHubScrape()" id="hub-btn">지금 수집</button>
-      <div class="sub" style="margin-top:6px">오픈API에 없는 <b>단가·수량·단위·조달방식</b>을 가져옵니다. 세부품명번호가 등록된 필터만 대상이며(품목 검색으로 추가), <b>최근 7일치</b>를 매일 알림 1시간 뒤 자동 수집합니다. 품목당 1~2분 걸립니다.</div>
+      <div class="sub" style="margin-top:6px">조달데이터허브에서 <b>단가·수량·단위·조달방식</b>까지 긁어옵니다(오픈API엔 없는 값). 세부품명번호가 등록된 필터만 대상이며(품목 검색으로 추가), 최근 7일치를 매일 알림 시간에 자동 실행하고 신규 항목이 있으면 푸시로 알립니다. 품목당 1~2분 걸립니다.</div>
       <div class="err" id="hub-err"></div>
     </div>
 
@@ -189,14 +170,11 @@ async function loadSettings() {
   const pill = document.getElementById('key-pill');
   pill.textContent = s.hasServiceKey ? '등록됨' : '미등록';
   pill.className = 'pill ' + (s.hasServiceKey ? 'ok' : 'warn');
-  document.getElementById('last-run-sub').textContent = s.lastRunAt
-    ? `마지막 조회: ${new Date(s.lastRunAt).toLocaleString('ko-KR')} · ${s.lastRunSummary || ''}`
+  document.getElementById('last-run-sub').textContent = s.lastHubAt
+    ? `마지막 조회: ${new Date(s.lastHubAt).toLocaleString('ko-KR')} · ${s.lastHubSummary || ''}`
     : `아직 조회 기록 없음 (매일 ${s.alarmTime} 자동 실행)`;
-  if (s.lastBackfillAt) {
-    document.getElementById('backfill-sub').textContent = `마지막 실행: ${new Date(s.lastBackfillAt).toLocaleString('ko-KR')} · ${s.lastBackfillSummary || ''}`;
-  }
   if (s.lastHubAt) {
-    document.getElementById('hub-sub').textContent = `마지막 수집: ${new Date(s.lastHubAt).toLocaleString('ko-KR')} · ${s.lastHubSummary || ''}`;
+    document.getElementById('hub-sub').textContent = `마지막 조회: ${new Date(s.lastHubAt).toLocaleString('ko-KR')} · ${s.lastHubSummary || ''}`;
   }
   document.getElementById('alarm-time').value = s.alarmTime || '07:00';
   window.__vapidKey = s.vapidPublicKey;
@@ -244,38 +222,17 @@ async function startHubScrape() {
   try {
     await api('/api/hub-scrape', { method: 'POST', body: JSON.stringify({}) });
   } catch (e) { err.textContent = e.message; return; }
-  btn.disabled = true; btn.textContent = '수집 중...';
+  btn.disabled = true; btn.textContent = '조회 중...';
   const poll = setInterval(async () => {
     const st = await api('/api/hub-scrape/status');
     sub.textContent = st.progress || '';
     if (st.status === 'done' || st.status === 'error') {
       clearInterval(poll);
-      btn.disabled = false; btn.textContent = '지금 수집';
+      btn.disabled = false; btn.textContent = '지금 계약 조회';
       if (st.error) err.textContent = st.error;
       await loadSettings(); await loadContracts();
     }
   }, 3000);
-}
-
-async function startBackfill() {
-  const btn = document.getElementById('backfill-btn');
-  const sub = document.getElementById('backfill-sub');
-  const err = document.getElementById('backfill-err');
-  err.textContent = '';
-  try {
-    await api('/api/backfill', { method: 'POST', body: JSON.stringify({ fromDate: '20260101' }) });
-  } catch (e) { err.textContent = e.message; return; }
-  btn.disabled = true; btn.textContent = '불러오는 중...';
-  const poll = setInterval(async () => {
-    const st = await api('/api/backfill/status');
-    sub.textContent = st.progress || '';
-    if (st.status === 'done' || st.status === 'error') {
-      clearInterval(poll);
-      btn.disabled = false; btn.textContent = '2026년 전체 내역 불러오기';
-      if (st.error) err.textContent = st.error;
-      await loadSettings(); await loadContracts();
-    }
-  }, 2000);
 }
 
 async function saveServiceKey() {
@@ -285,16 +242,6 @@ async function saveServiceKey() {
   if (!serviceKey) return;
   try { await api('/api/settings/service-key', { method: 'POST', body: JSON.stringify({ serviceKey }) }); await loadSettings(); }
   catch (e) { err.textContent = e.message; }
-}
-
-async function testFetch() {
-  const pre = document.getElementById('test-result');
-  const err = document.getElementById('key-err');
-  err.textContent = ''; pre.style.display = 'block'; pre.textContent = '조회 중...';
-  try {
-    const data = await api('/api/test-fetch?days=3');
-    pre.textContent = JSON.stringify(data, null, 2);
-  } catch (e) { err.textContent = e.message; pre.style.display = 'none'; }
 }
 
 let selectedItemCode = null;
@@ -327,17 +274,6 @@ async function searchItems() {
   } catch (e) { err.textContent = e.message; results.innerHTML = ''; }
 }
 
-async function checkNow() {
-  const btn = document.getElementById('check-now-btn');
-  const err = document.getElementById('check-err'), msg = document.getElementById('check-msg');
-  err.textContent = ''; msg.textContent = ''; btn.disabled = true; btn.textContent = '조회 중...';
-  try {
-    const data = await api('/api/check-now', { method: 'POST', body: JSON.stringify({ daysBack: 1 }) });
-    msg.textContent = `조회 완료: 원본 ${data.totalFetched}건 중 신규 매칭 발생`;
-    await loadSettings(); await loadContracts();
-  } catch (e) { err.textContent = e.message; }
-  finally { btn.disabled = false; btn.textContent = '지금 계약 조회'; }
-}
 
 let allFilters = [];
 
@@ -369,25 +305,19 @@ async function addFilter() {
   renderContractTabs();
 }
 
-let allContracts = [];
 let activeFilterId = 'all';
 let hubItems = [];   // 조달데이터허브에서 긁어온 라인아이템(단가·수량·단위 포함)
 
-// 오픈API 계약 데이터와 허브 라인아이템은 컬럼 구성이 달라서 표 헤더를 각각 정의한다.
-const API_COLS = ['업무구분', '계약(납품요구)일자', '수요기관', '세부품명번호', '세부품명', '업체명', '낙찰방법', '계약금액'];
 const HUB_COLS = ['조달방식', '업무구분', '계약구분', '계약(납품요구)일자', '수요기관', '수요기관소재시군구',
   '세부품명번호', '세부품명', '품목명', '업체명', '낙찰방법', '단위', '계약납품단가', '계약납품수량', '공급금액'];
 
 async function loadContracts() {
-  allContracts = await api('/api/contracts?limit=200');
   hubItems = await api('/api/hub-items?limit=1000').catch(() => []);
   renderContractTabs();
   renderContractList();
 }
 
-// 탭은 등록된 필터 전체를 기준으로 만든다(allContracts만 보면, 허브 수집만 하고 아직
-// 알림 매칭이 없는 필터는 탭 자체가 안 생기는 문제가 있었다). 건수는 허브 자료가 있으면
-// 그쪽을, 없으면 알림 매칭 건수를 보여준다.
+// 탭은 등록된 필터 전체를 기준으로 만든다(허브 수집을 아직 안 돌린 필터도 0건 탭으로 보이게).
 function renderContractTabs() {
   const tabs = document.getElementById('contract-tabs');
   const validIds = new Set(allFilters.map((f) => f.id));
@@ -400,11 +330,9 @@ function renderContractTabs() {
     btn.onclick = () => { activeFilterId = id; renderContractTabs(); renderContractList(); };
     tabs.appendChild(btn);
   };
-  const totalCount = hubItems.length || allContracts.length;
-  makeTab('all', `전체 (${totalCount})`);
+  makeTab('all', `전체 (${hubItems.length})`);
   for (const f of allFilters) {
-    const hubCount = f.item_code ? hubItems.filter((h) => h['세부품명번호'] === f.item_code).length : 0;
-    const count = hubCount || allContracts.filter((r) => r.filter_id === f.id).length;
+    const count = f.item_code ? hubItems.filter((h) => h['세부품명번호'] === f.item_code).length : 0;
     makeTab(f.id, `${f.keyword}${f.region ? ' · ' + f.region : ''} (${count})`);
   }
 }
@@ -434,38 +362,18 @@ function renderContractList() {
   const code = activeItemCode();
   const hubRows = code ? hubItems.filter((h) => h['세부품명번호'] === code) : hubItems;
 
+  setHeader(HUB_COLS);
+  empty.style.display = hubRows.length ? 'none' : 'block';
   if (hubRows.length) {
-    setHeader(HUB_COLS);
     pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
-    note.style.display = ''; note.textContent = `조달데이터허브 자료 ${hubRows.length}건 (npm run scrape-hub 으로 수집)`;
-    empty.style.display = 'none';
-    for (const h of hubRows) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = HUB_COLS.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
-      tbody.appendChild(tr);
-    }
-    return;
+    note.style.display = ''; note.textContent = `조달데이터허브 자료 ${hubRows.length}건`;
+  } else {
+    pill.style.display = 'none';
+    note.style.display = 'none';
   }
-
-  // 허브 자료가 없으면 오픈API 기반 계약 목록을 보여준다(단가·수량 없음)
-  setHeader(API_COLS);
-  pill.style.display = 'none';
-  note.style.display = 'none';
-  const rows = activeFilterId === 'all' ? allContracts : allContracts.filter((r) => r.filter_id === activeFilterId);
-  empty.style.display = rows.length ? 'none' : 'block';
-  for (const r of rows) {
-    const s = r.summary || {};
+  for (const h of hubRows) {
     const tr = document.createElement('tr');
-    tr.innerHTML =
-      cellHtml(s.bizType || '물품', 'center') +
-      cellHtml(s.contractDate) +
-      cellHtml(s.demandOrg) +
-      cellHtml(r.item_code, 'center') +
-      cellHtml(r.keyword) +
-      cellHtml(s.company) +
-      cellHtml(s.bidMethod, 'center') +
-      cellHtml(s.amount ? Number(s.amount).toLocaleString() + '원' : '', 'num');
-    if (s.detailUrl) { tr.style.cursor = 'pointer'; tr.onclick = () => window.open(s.detailUrl, '_blank'); }
+    tr.innerHTML = HUB_COLS.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
     tbody.appendChild(tr);
   }
 }

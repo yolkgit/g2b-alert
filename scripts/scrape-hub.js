@@ -171,17 +171,26 @@ function parseCsvFile(file) {
   return { header, rows: data.map((r) => Object.fromEntries(header.map((h, i) => [h, (r[i] || '').trim()]))) };
 }
 
-// 긁은 라인아이템을 앱 DB(hub_items)에 넣는다. 앱이 이 표를 화면에 그린다.
+// 긁은 라인아이템을 앱 DB(hub_items)에 넣는다. 앱이 이 표를 화면에 그리고, 이 함수가 돌려주는
+// "신규" 목록으로 서버가 푸시 알림을 보낸다(하나의 라인아이템 = (계약번호,변경차수,물품순번) 키).
+// NEW_ROWS_FILE 환경변수가 있으면(서버가 자식 프로세스로 띄울 때) 신규 목록을 그 파일에도 쓴다 —
+// 서버는 stdout이 아니라 그 파일을 읽어서 알림 본문(품목명·기관명 등)을 구성한다.
 // DB_PATH 환경변수로 대상 지정 가능(기본: 프로젝트의 data.db).
 function saveToDb(rows) {
   let Database;
-  try { Database = require('better-sqlite3'); } catch { console.log('   [DB] better-sqlite3 없음 — 건너뜀'); return; }
+  try { Database = require('better-sqlite3'); } catch { console.log('   [DB] better-sqlite3 없음 — 건너뜀'); return []; }
   const dbPath = process.env.DB_PATH || require('path').join(__dirname, '..', 'data.db');
   const db = new Database(dbPath);
   db.exec(`CREATE TABLE IF NOT EXISTS hub_items (
     contract_no TEXT NOT NULL, chg_seq TEXT NOT NULL, item_seq TEXT NOT NULL,
     item_code TEXT, contract_date TEXT, raw_json TEXT NOT NULL, fetched_at TEXT NOT NULL,
     PRIMARY KEY (contract_no, chg_seq, item_seq))`);
+
+  const keyOf = (r) => `${r['계약(납품요구)번호'] || ''}|${r['변경차수'] || ''}|${r['물품순번'] || ''}`;
+  const existing = new Set(
+    db.prepare(`SELECT contract_no || '|' || chg_seq || '|' || item_seq AS k FROM hub_items`).all().map((r) => r.k));
+  const newRows = rows.filter((r) => !existing.has(keyOf(r)));
+
   const up = db.prepare(`INSERT INTO hub_items
     (contract_no, chg_seq, item_seq, item_code, contract_date, raw_json, fetched_at)
     VALUES (?,?,?,?,?,?,?)
@@ -195,8 +204,13 @@ function saveToDb(rows) {
     }
   });
   tx(rows);
-  console.log(`   [DB] hub_items 저장 ${rows.length}건 → ${dbPath}`);
+  console.log(`   [DB] hub_items 저장 ${rows.length}건(신규 ${newRows.length}건) → ${dbPath}`);
   db.close();
+
+  if (process.env.NEW_ROWS_FILE) {
+    fs.writeFileSync(process.env.NEW_ROWS_FILE, JSON.stringify(newRows));
+  }
+  return newRows;
 }
 
 // "안내 메시지" 같은 검증 팝업이 떠 있으면 내용을 읽고 닫는다.

@@ -1,13 +1,12 @@
 const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 const cron = require('node-cron');
 const { spawn } = require('child_process');
 const webpush = require('web-push');
 
-const { fetchContracts } = require('./g2bClient');
 const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
-const { summarize, itemMatchesKeyword, buildContractKey } = require('./fields');
 
 const app = express();
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db');
@@ -29,33 +28,6 @@ db.exec(`
     auth TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS seen_contracts (
-    contract_key TEXT NOT NULL,
-    filter_id INTEGER NOT NULL,
-    raw_json TEXT NOT NULL,
-    summary_json TEXT NOT NULL,
-    matched_keyword TEXT,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (contract_key, filter_id)
-  );
-  CREATE TABLE IF NOT EXISTS raw_contracts (
-    contract_key TEXT PRIMARY KEY,
-    raw_json TEXT NOT NULL,
-    fetched_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS fetch_log (
-    begin_date TEXT NOT NULL,
-    end_date TEXT NOT NULL,
-    fetched_at TEXT NOT NULL,
-    item_count INTEGER NOT NULL,
-    PRIMARY KEY (begin_date, end_date)
-  );
-  CREATE TABLE IF NOT EXISTS fetch_items (
-    begin_date TEXT NOT NULL,
-    end_date TEXT NOT NULL,
-    contract_key TEXT NOT NULL,
-    PRIMARY KEY (begin_date, end_date, contract_key)
-  );
   -- 조달데이터허브 보고서에서 긁어온 라인아이템(단가·수량·단위 포함).
   -- 오픈API에는 없는 값들이라 scripts/scrape-hub.js가 따로 채운다.
   CREATE TABLE IF NOT EXISTS hub_items (
@@ -73,24 +45,6 @@ db.exec(`
 
 // filters.item_code는 뒤늦게 추가된 컬럼이라, 이미 만들어진 filters 테이블에는 없을 수 있다
 try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
-
-// fields.js에 bizType/bidMethod를 뒤늦게 추가했는데, 이미 저장된 seen_contracts.summary_json은
-// raw_json은 그대로 있으니 API를 다시 부르지 않고도 재계산할 수 있다 — 부팅 시 한 번 채워준다.
-{
-  const staleRows = db.prepare(`SELECT contract_key, filter_id, raw_json, summary_json FROM seen_contracts`).all();
-  const updateSummaryStmt = db.prepare(`UPDATE seen_contracts SET summary_json = ? WHERE contract_key = ? AND filter_id = ?`);
-  const migrateSummariesTx = db.transaction((rows) => {
-    let migrated = 0;
-    for (const r of rows) {
-      if ('bizType' in JSON.parse(r.summary_json)) continue;
-      updateSummaryStmt.run(JSON.stringify(summarize(JSON.parse(r.raw_json))), r.contract_key, r.filter_id);
-      migrated++;
-    }
-    return migrated;
-  });
-  const migratedCount = migrateSummariesTx(staleRows);
-  if (migratedCount) console.log(`summary_json 재계산: ${migratedCount}건`);
-}
 
 function getSetting(key, fallback = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
@@ -155,10 +109,6 @@ app.get('/api/settings', (req, res) => {
   res.json({
     hasServiceKey: !!getSetting('g2b_service_key'),
     vapidPublicKey: getSetting('vapid_public'),
-    lastRunAt: getSetting('last_run_at'),
-    lastRunSummary: getSetting('last_run_summary'),
-    lastBackfillAt: getSetting('last_backfill_at'),
-    lastBackfillSummary: getSetting('last_backfill_summary'),
     alarmTime: getSetting('alarm_time', '07:00'),
     lastHubAt: getSetting('last_hub_at'),
     lastHubSummary: getSetting('last_hub_summary'),
@@ -207,7 +157,6 @@ app.post('/api/filters', (req, res) => {
 });
 app.delete('/api/filters/:id', (req, res) => {
   db.prepare(`DELETE FROM filters WHERE id = ?`).run(req.params.id);
-  db.prepare(`DELETE FROM seen_contracts WHERE filter_id = ?`).run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -243,199 +192,9 @@ async function sendPushToAll(payload) {
   }
 }
 
-// ─── 계약 조회 / 매칭 / 알림 ──────────────────────────────
 function fmtDate(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
-
-const insertRawStmt = db.prepare(`INSERT INTO raw_contracts (contract_key, raw_json, fetched_at)
-    VALUES (?, ?, ?) ON CONFLICT(contract_key) DO NOTHING`);
-const insertFetchItemStmt = db.prepare(`INSERT INTO fetch_items (begin_date, end_date, contract_key)
-    VALUES (?, ?, ?) ON CONFLICT(begin_date, end_date, contract_key) DO NOTHING`);
-const upsertFetchLogStmt = db.prepare(`INSERT INTO fetch_log (begin_date, end_date, fetched_at, item_count)
-    VALUES (?, ?, ?, ?) ON CONFLICT(begin_date, end_date) DO UPDATE SET fetched_at = excluded.fetched_at, item_count = excluded.item_count`);
-const getFetchLogStmt = db.prepare(`SELECT 1 FROM fetch_log WHERE begin_date = ? AND end_date = ?`);
-const getCachedRawStmt = db.prepare(`
-  SELECT rc.raw_json FROM fetch_items fi JOIN raw_contracts rc ON rc.contract_key = fi.contract_key
-  WHERE fi.begin_date = ? AND fi.end_date = ?
-`);
-const cacheRawTx = db.transaction((beginDate, endDate, items) => {
-  const now = new Date().toISOString();
-  for (const item of items) {
-    const key = buildContractKey(item);
-    insertRawStmt.run(key, JSON.stringify(item), now);
-    insertFetchItemStmt.run(beginDate, endDate, key);
-  }
-});
-
-// beginDate~endDate가 이미(완전히 지난 기간으로) API에서 받아온 적 있으면 캐시에서 그대로 돌려주고,
-// 없으면 API를 호출해서 캐시에 저장한다. 오늘을 포함하는 구간은 계속 바뀔 수 있어 캐시하지 않고
-// 항상 새로 부른다. 캐시 재생 시 항목의 계약일자로 다시 걸러내지 않는다 — cntrctCnclsDate/cntrctDate가
-// 실제 조회 기준(계약 변경 이력 등)과 다른 경우가 있어 그렇게 하면 항목이 누락된다(실측 확인함).
-// 대신 fetch_items로 "이 구간을 조회했을 때 실제로 돌아온 항목"을 그대로 기록해서 재생한다.
-async function getOrFetchChunk(serviceKey, beginDate, endDate) {
-  const today = fmtDate(new Date());
-  const cacheable = endDate < today;
-  if (cacheable && getFetchLogStmt.get(beginDate, endDate)) {
-    const rows = getCachedRawStmt.all(beginDate, endDate);
-    return { items: rows.map((r) => JSON.parse(r.raw_json)), truncated: false, fromCache: true };
-  }
-  const result = await fetchContracts(serviceKey, beginDate, endDate);
-  if (cacheable) {
-    cacheRawTx(beginDate, endDate, result.items);
-    upsertFetchLogStmt.run(beginDate, endDate, new Date().toISOString(), result.items.length);
-  }
-  return { ...result, fromCache: false };
-}
-
-const insertSeenStmt = db.prepare(`INSERT INTO seen_contracts
-    (contract_key, filter_id, raw_json, summary_json, matched_keyword, created_at)
-    VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(contract_key, filter_id) DO NOTHING`);
-const alreadySeenStmt = db.prepare(`SELECT 1 FROM seen_contracts WHERE contract_key = ? AND filter_id = ?`);
-
-// items를 filters에 매칭시켜 처음 보는 것만 seen_contracts에 저장하고, 필터별 신규 매칭 목록을 돌려준다
-function matchAndStore(items, filters) {
-  const newByFilter = new Map();
-  for (const item of items) {
-    const key = buildContractKey(item);
-    for (const filter of filters) {
-      const kwMatch = itemMatchesKeyword(item, filter.keyword);
-      const rgMatch = !filter.region || itemMatchesKeyword(item, filter.region);
-      if (!kwMatch || !rgMatch) continue;
-      if (alreadySeenStmt.get(key, filter.id)) continue;
-
-      const summary = summarize(item);
-      insertSeenStmt.run(key, filter.id, JSON.stringify(item), JSON.stringify(summary), filter.keyword, new Date().toISOString());
-      if (!newByFilter.has(filter.id)) newByFilter.set(filter.id, { filter, items: [] });
-      newByFilter.get(filter.id).items.push(summary);
-    }
-  }
-  return newByFilter;
-}
-
-async function runDailyCheck({ daysBack = 1 } = {}) {
-  const serviceKey = getSetting('g2b_service_key');
-  if (!serviceKey) return { error: '서비스키가 설정되지 않았습니다' };
-
-  const end = new Date();
-  const begin = new Date(end.getTime() - daysBack * 86400000);
-  const beginDate = fmtDate(begin), endDate = fmtDate(end);
-
-  const { items, operation, truncated, meta } = await fetchContracts(serviceKey, beginDate, endDate);
-  const filters = db.prepare(`SELECT * FROM filters`).all();
-  const newByFilter = matchAndStore(items, filters);
-
-  for (const { filter, items: matched } of newByFilter.values()) {
-    const top = matched.slice(0, 3).map((m) => `${m.itemName || '품목명 미확인'} / ${m.demandOrg || '기관 미확인'}`).join('\n');
-    await sendPushToAll({
-      title: `나라장터 신규 계약 ${matched.length}건 - ${filter.keyword}`,
-      body: top,
-      url: '/',
-    });
-  }
-
-  const summaryText = `${beginDate}~${endDate} 조회(${operation}${truncated ? ', 일부 페이지 생략됨' : ''}), 원본 ${items.length}건, 신규 매칭 ${[...newByFilter.values()].reduce((s, v) => s + v.items.length, 0)}건`;
-  setSetting('last_run_at', new Date().toISOString());
-  setSetting('last_run_summary', summaryText);
-
-  return { beginDate, endDate, operation, totalFetched: items.length, truncated, meta, newByFilter: Object.fromEntries([...newByFilter].map(([k, v]) => [k, v.items])) };
-}
-
-// 하루 단위로 잘라서 훑는 과거 내역 일괄 조회(알림 없음, 필터에 매칭되는 것만 저장). 결과를 바로 쓰지
-// 않고 백그라운드로 돌리는 이유: 몇 달치를 훑으면 API 호출이 수백 번이라 리버스 프록시 타임아웃을 넘긴다.
-let backfillState = { status: 'idle', progress: '', error: null };
-
-async function runBackfillJob(fromDate, toDate) {
-  const serviceKey = getSetting('g2b_service_key');
-  if (!serviceKey) { backfillState = { status: 'error', progress: '', error: '서비스키가 설정되지 않았습니다' }; return; }
-  const filters = db.prepare(`SELECT * FROM filters`).all();
-  if (!filters.length) { backfillState = { status: 'error', progress: '', error: '등록된 필터가 없습니다' }; return; }
-
-  const chunkMs = 7 * 86400000;
-  const from = new Date(`${fromDate.slice(0, 4)}-${fromDate.slice(4, 6)}-${fromDate.slice(6, 8)}T00:00:00Z`);
-  const to = new Date(`${toDate.slice(0, 4)}-${toDate.slice(4, 6)}-${toDate.slice(6, 8)}T00:00:00Z`);
-  const chunks = [];
-  for (let t = from.getTime(); t < to.getTime(); t += chunkMs) {
-    chunks.push([new Date(t), new Date(Math.min(t + chunkMs, to.getTime()))]);
-  }
-
-  let totalFetched = 0;
-  let totalMatched = 0;
-  let truncatedAny = false;
-  let cachedChunks = 0;
-  for (let i = 0; i < chunks.length; i++) {
-    const [begin, end] = chunks[i];
-    const beginDate = fmtDate(begin), endDate = fmtDate(end);
-    backfillState = { status: 'running', progress: `${i + 1}/${chunks.length} 구간 조회 중 (${beginDate}~${endDate}), 지금까지 원본 ${totalFetched}건 · 매칭 ${totalMatched}건 (캐시 ${cachedChunks}구간 재사용)`, error: null };
-    try {
-      const { items, truncated, fromCache } = await getOrFetchChunk(serviceKey, beginDate, endDate);
-      if (fromCache) cachedChunks++;
-      totalFetched += items.length;
-      if (truncated) truncatedAny = true;
-      const newByFilter = matchAndStore(items, filters);
-      for (const { items: matched } of newByFilter.values()) totalMatched += matched.length;
-    } catch (err) {
-      // 중간에 실패해도 여기까지 처리한 구간은 이미 매칭·저장됐으니(캐시된 구간은 다음 번에 이어서
-      // 재사용됨) 진행 상황을 남겨서 "얼마나 됐었는지"가 사라지지 않게 한다.
-      const partialSummary = `${fromDate}~${toDate} 조회 중 ${i}/${chunks.length}구간에서 중단(${beginDate}~${endDate} 실패), 그때까지 원본 ${totalFetched}건 중 매칭 ${totalMatched}건 (캐시 재사용 ${cachedChunks}구간) — ${err.message}`;
-      setSetting('last_backfill_at', new Date().toISOString());
-      setSetting('last_backfill_summary', partialSummary);
-      backfillState = { status: 'error', progress: partialSummary, error: err.message };
-      return;
-    }
-  }
-
-  const summaryText = `${fromDate}~${toDate} 전체 조회, 원본 ${totalFetched}건 중 매칭 ${totalMatched}건 (캐시 재사용 ${cachedChunks}/${chunks.length}구간)${truncatedAny ? ' (일부 구간 최대 페이지 초과로 일부 생략됨)' : ''}`;
-  setSetting('last_backfill_at', new Date().toISOString());
-  setSetting('last_backfill_summary', summaryText);
-  backfillState = { status: 'done', progress: summaryText, error: null };
-}
-
-app.post('/api/check-now', async (req, res) => {
-  try {
-    const result = await runDailyCheck({ daysBack: Number(req.body?.daysBack) || 1 });
-    if (result.error) return res.status(400).json(result);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/backfill', (req, res) => {
-  if (backfillState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
-  const fromDate = req.body?.fromDate || '20260101';
-  const toDate = req.body?.toDate || fmtDate(new Date());
-  backfillState = { status: 'running', progress: '시작 중...', error: null };
-  runBackfillJob(fromDate, toDate).catch((err) => { backfillState = { status: 'error', progress: '', error: err.message }; });
-  res.json({ started: true, fromDate, toDate });
-});
-
-app.get('/api/backfill/status', (req, res) => res.json(backfillState));
-
-// 실제 API 응답 구조를 필드명 확정 없이 그대로 확인하기 위한 원본 미리보기
-app.get('/api/test-fetch', async (req, res) => {
-  try {
-    const serviceKey = getSetting('g2b_service_key');
-    if (!serviceKey) return res.status(400).json({ error: '서비스키가 설정되지 않았습니다' });
-    const days = Number(req.query.days) || 3;
-    const end = new Date();
-    const begin = new Date(end.getTime() - days * 86400000);
-    const { items, operation, meta } = await fetchContracts(serviceKey, fmtDate(begin), fmtDate(end), { maxPages: 1, numOfRows: 20 });
-    res.json({ operation, meta, sampleCount: items.length, sample: items.slice(0, 5) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/contracts', (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 50, 200);
-  const rows = db.prepare(`
-    SELECT sc.contract_key, sc.filter_id, sc.summary_json, sc.matched_keyword, sc.created_at, f.keyword, f.region, f.item_code
-    FROM seen_contracts sc JOIN filters f ON f.id = sc.filter_id
-    ORDER BY sc.created_at DESC LIMIT ?
-  `).all(limit);
-  res.json(rows.map((r) => ({ ...r, summary: JSON.parse(r.summary_json), summary_json: undefined })));
-});
 
 // 조달데이터허브에서 긁어온 라인아이템. 필터 키워드(=세부품명)나 코드로 좁혀서 본다.
 app.get('/api/hub-items', (req, res) => {
@@ -449,21 +208,10 @@ app.get('/api/hub-items', (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-let dailyTask = null;
-function scheduleDailyCheck(time) {
-  if (dailyTask) dailyTask.stop();
-  const [hh, mm] = time.split(':').map(Number);
-  dailyTask = cron.schedule(`${mm} ${hh} * * *`, () => {
-    runDailyCheck({ daysBack: 1 }).catch((err) => console.error('daily check failed:', err.message));
-  }, { timezone: 'Asia/Seoul' });
-}
-scheduleDailyCheck(getSetting('alarm_time', '07:00'));
-
 app.post('/api/settings/alarm-time', (req, res) => {
   const { time } = req.body || {};
   if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(time || '')) return res.status(400).json({ error: '시간 형식이 올바르지 않습니다 (HH:MM)' });
   setSetting('alarm_time', time);
-  scheduleDailyCheck(time);
   scheduleHubScrape(time);
   res.json({ ok: true });
 });
@@ -475,11 +223,12 @@ let hubState = { status: 'idle', progress: '', error: null };
 
 function runHubScrape(code, fromDate, toDate) {
   return new Promise((resolve) => {
+    const newRowsFile = path.join(path.dirname(DB_PATH), `hub-new-${code}-${process.pid}.json`);
     const args = [path.join(__dirname, 'scripts', 'scrape-hub.js'), code];
     if (fromDate && toDate) args.push(fromDate, toDate);
     const child = spawn(process.execPath, args, {
       cwd: __dirname,
-      env: { ...process.env, HUB_SHOTS: '0' }, // 서버에선 스크린샷 생략
+      env: { ...process.env, HUB_SHOTS: '0', NEW_ROWS_FILE: newRowsFile }, // 서버에선 스크린샷 생략
     });
     let tail = '';
     const keep = (buf) => { tail = (tail + buf.toString()).slice(-2000); };
@@ -487,7 +236,14 @@ function runHubScrape(code, fromDate, toDate) {
     child.stderr.on('data', keep);
     child.on('close', (exitCode) => {
       const m = tail.match(/중복 제거 후 (\d+)건/);
-      resolve({ exitCode, count: m ? Number(m[1]) : null, tail });
+      let newRows = [];
+      try {
+        if (fs.existsSync(newRowsFile)) {
+          newRows = JSON.parse(fs.readFileSync(newRowsFile, 'utf8'));
+          fs.unlinkSync(newRowsFile);
+        }
+      } catch (e) { console.error('[hub] 신규 항목 파일 읽기 실패:', e.message); }
+      resolve({ exitCode, count: m ? Number(m[1]) : null, newRows, tail });
     });
   });
 }
@@ -540,11 +296,26 @@ async function runHubScrapeAll({ fromDate, toDate } = {}) {
     const r = await runHubScrape(f.item_code, fromDate, toDate);
     done.push(`${f.keyword} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`);
     if (r.exitCode !== 0) console.error(`[hub] ${f.keyword} 실패:\n${r.tail.slice(-600)}`);
+    if (r.newRows && r.newRows.length) await notifyNewHubRows(f, r.newRows);
   }
   const summary = `${new Date().toLocaleString('ko-KR')} · ${done.join(', ')}`;
   setSetting('last_hub_at', new Date().toISOString());
   setSetting('last_hub_summary', summary);
   hubState = { status: 'done', progress: summary, error: null };
+}
+
+// 이번 수집에서 새로 발견된(=hub_items에 처음 들어간) 라인아이템을 필터별로 알림 보낸다.
+// hub_items의 PK(계약번호+변경차수+물품순번)가 그대로 "이미 알렸는지" 판단 기준이라 별도
+// dedup 테이블이 필요 없다 — 다음 수집에서 같은 항목은 다시 신규로 잡히지 않는다.
+async function notifyNewHubRows(filter, rows) {
+  const top = rows.slice(0, 3)
+    .map((r) => `${r['품목명'] || filter.keyword} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? Number(r['계약납품단가']).toLocaleString() + '원' : ''}`)
+    .join('\n');
+  await sendPushToAll({
+    title: `나라장터 신규 계약 ${rows.length}건 - ${filter.keyword}`,
+    body: top,
+    url: '/',
+  });
 }
 
 app.post('/api/hub-scrape', (req, res) => {
@@ -556,12 +327,12 @@ app.post('/api/hub-scrape', (req, res) => {
 });
 app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
 
-// 매일 알림 시간 1시간 뒤에 허브 수집(느리고 무거워서 알림과 겹치지 않게 띄운다)
+// 설정된 알림 시간에 허브 수집을 돌린다 — 이게 곧 매일 알림이다(신규 항목이 있으면 푸시 발송).
 let hubTask = null;
 function scheduleHubScrape(time) {
   if (hubTask) hubTask.stop();
   const [hh, mm] = time.split(':').map(Number);
-  hubTask = cron.schedule(`${mm} ${(hh + 1) % 24} * * *`, () => {
+  hubTask = cron.schedule(`${mm} ${hh} * * *`, () => {
     if (hubState.status === 'running') return;
     runHubScrapeAll().catch((e) => console.error('hub scrape failed:', e.message));
   }, { timezone: 'Asia/Seoul' });
