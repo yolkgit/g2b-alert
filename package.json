@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "gen-icons": "node scripts/gen-icons.js",
+    "gen-og": "node scripts/gen-og-image.js",
     "scrape-hub": "node scripts/scrape-hub.js",
     "explore-hub": "node scripts/explore-hub.js"
   },

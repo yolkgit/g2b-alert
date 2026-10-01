@@ -8,8 +8,10 @@ const { spawn } = require('child_process');
 const webpush = require('web-push');
 
 const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
+const { registerSeoRoutes } = require('./seo');
 
 const app = express();
+app.disable('x-powered-by');
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db');
 const db = new Database(DB_PATH);
 db.pragma('foreign_keys = ON');
@@ -399,6 +401,9 @@ app.get('/api/hub-items/counts', (req, res) => {
   res.json({ total, byCode: Object.fromEntries(byCode.map((r) => [r.item_code, r.c])) });
 });
 
+// 검색엔진용 공개 페이지(/, /items, /item/:code, robots.txt, sitemap.xml) — "/"를 static보다
+// 먼저 가로채야 해서 이 위치에 둔다.
+registerSeoRoutes(app, { db, getSessionUser });
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.post('/api/settings/alarm-time', (req, res) => {

@@ -1,0 +1,58 @@
+/* 공개 품목 페이지(/items, /item/:code) 전용 — 앱(index.html)과 같은 shadcn 토큰 */
+:root{
+  --background:#fff; --foreground:#18181b; --muted:#f4f4f5; --muted-foreground:#71717a;
+  --border:#e4e4e7; --primary:#18181b; --primary-foreground:#fafafa; --radius:.5rem;
+  --shadow-sm:0 1px 2px 0 rgb(0 0 0 / .05);
+}
+*{box-sizing:border-box;margin:0}
+body{font-family:'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR',-apple-system,'Segoe UI',sans-serif;background:var(--muted);color:var(--foreground);line-height:1.6;-webkit-text-size-adjust:100%;word-break:keep-all;overflow-wrap:break-word}
+a{color:inherit;text-underline-offset:2px}
+.wrap{max-width:1040px;margin:0 auto;padding:0 16px}
+.site-header{background:var(--background);border-bottom:1px solid var(--border)}
+.site-header .wrap{display:flex;justify-content:space-between;align-items:center;gap:12px;height:56px}
+.brand{font-weight:700;font-size:15px;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--primary);color:var(--primary-foreground);border-radius:calc(var(--radius) - 2px);padding:9px 16px;font-size:13px;font-weight:500;text-decoration:none;white-space:nowrap;flex:none}
+.btn:hover{opacity:.9}
+main.wrap{padding-top:24px;padding-bottom:32px}
+.crumbs{font-size:12px;color:var(--muted-foreground);margin-bottom:12px}
+.crumbs a{text-decoration:none}
+.crumbs a:hover{text-decoration:underline}
+h1{font-size:26px;line-height:1.35;letter-spacing:-.02em;margin-bottom:10px}
+.lead{font-size:14px;color:var(--muted-foreground);margin-bottom:20px;max-width:780px}
+.sub{font-size:12px;color:var(--muted-foreground)}
+.card .sub{margin:-6px 0 10px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.stat{background:var(--background);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow-sm)}
+.stat span{display:block;font-size:12px;color:var(--muted-foreground)}
+.stat b{display:block;font-size:20px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.cta{display:flex;justify-content:space-between;align-items:center;gap:16px;background:var(--primary);color:var(--primary-foreground);border-radius:var(--radius);padding:18px 20px;margin-bottom:16px}
+.cta p{font-size:13px;opacity:.75;margin-top:2px}
+.cta .btn{background:var(--primary-foreground);color:var(--primary)}
+.card{background:var(--background);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-sm)}
+.card h2{font-size:16px;font-weight:600;margin-bottom:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;font-weight:500;color:var(--muted-foreground);padding:8px 6px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:9px 6px;border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:top}
+td.wrap-cell{white-space:normal;min-width:96px;max-width:150px;word-break:keep-all;overflow-wrap:anywhere}
+td.wrap-cell.long{min-width:180px;max-width:260px;color:var(--muted-foreground)}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:var(--muted)}
+.item-list{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.item-list a{display:block;background:var(--background);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;text-decoration:none;box-shadow:var(--shadow-sm)}
+.item-list a:hover{border-color:var(--foreground)}
+.item-list b{display:block;font-size:15px}
+.item-list span{font-size:12px;color:var(--muted-foreground)}
+.chips{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:8px}
+.chips a{display:inline-block;background:var(--muted);border:1px solid var(--border);border-radius:999px;padding:5px 14px;font-size:13px;text-decoration:none}
+.chips a:hover{border-color:var(--foreground)}
+.site-footer{border-top:1px solid var(--border);background:var(--background);font-size:12px;color:var(--muted-foreground);padding:20px 0}
+@media (max-width:760px){
+  h1{font-size:21px}
+  .stats{grid-template-columns:1fr 1fr}
+  .stat b{font-size:17px}
+  .cta{flex-direction:column;align-items:stretch}
+  .grid2{grid-template-columns:1fr}
+  .brand{font-size:14px}
+}
