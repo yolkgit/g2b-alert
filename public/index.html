@@ -495,7 +495,7 @@ async function addFilterFromSearch(keyword, itemCode) {
     document.getElementById('item-search').value = '';
     document.getElementById('item-search-results').innerHTML = '';
     await loadFilters();
-    renderContractTabs();
+    await loadContracts(); // 탭 건수는 필터별이라 새 필터 건수를 다시 받아와야 한다(삭제할 때와 같게)
   } catch (e) { err.textContent = e.message; }
 }
 
