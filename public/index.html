@@ -63,6 +63,10 @@ a{color:var(--foreground);text-decoration:underline;text-underline-offset:2px;fo
 .tabs button.active{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
 table{width:100%;border-collapse:collapse;font-size:12px}
 thead th{background:transparent;color:var(--muted-foreground);font-weight:500;padding:8px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;text-align:left}
+thead th.sortable{cursor:pointer;user-select:none}
+thead th.sortable:hover,thead th[aria-sort]{color:var(--foreground)}
+thead th.num{text-align:right}
+.sort-ind{font-size:9px;margin-left:4px}
 tbody td{padding:10px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 tbody tr:hover{background:var(--muted)}
 td.num{text-align:right;color:var(--foreground);font-variant-numeric:tabular-nums}
@@ -227,7 +231,7 @@ html.authed #main-view{display:block}
       <h2>알림 받을 품목/지역</h2>
       <div class="row" style="align-items:flex-end">
         <input id="item-search" style="flex:2;margin-bottom:0" placeholder="품목 검색 (예: 제설제)" onkeydown="if(event.key==='Enter'){event.preventDefault();searchItems();}">
-        <input id="filter-region" style="flex:1;margin-bottom:0" placeholder="지역(선택)">
+        <input id="filter-region" style="flex:1;margin-bottom:0" placeholder="지역 (예: 서울, 경기 수원)" title="수요기관 소재지 기준 · 여러 곳은 쉼표로 구분 (예: 서울, 경기 수원, 충남)">
         <button class="secondary" style="flex:none" onclick="searchItems()">검색</button>
       </div>
       <div id="item-search-err" class="err"></div>
@@ -448,7 +452,10 @@ async function searchItems() {
   const err = document.getElementById('item-search-err');
   const results = document.getElementById('item-search-results');
   err.textContent = ''; results.innerHTML = '';
-  if (!keyword) return;
+  if (!keyword) {
+    if (document.getElementById('filter-region').value.trim()) err.textContent = '품목명도 입력하세요 — 검색 결과에서 품목을 고르면 입력한 지역으로 등록됩니다';
+    return;
+  }
   results.innerHTML = '<div class="sub">검색 중...</div>';
   try {
     const data = await api(`/api/item-lookup?keyword=${encodeURIComponent(keyword)}`);
@@ -514,8 +521,9 @@ async function loadFilters() {
 }
 
 let activeFilterId = 'all';
-let tabCounts = { total: 0, byCode: {} }; // 탭 라벨용 품목별 전체 건수(기간 필터와 무관)
+let tabCounts = { total: 0, byFilter: {} }; // 탭 라벨용 필터별 전체 건수(기간 필터와 무관, 지역은 반영)
 let currentPage = 1;
+let sortCol = '계약(납품요구)일자', sortDir = 'desc'; // 표 머리글 클릭 정렬(서버에서 전체 기준으로 정렬)
 const PAGE_SIZE = 20;
 let queryFrom = '', queryTo = ''; // "조회" 버튼으로 적용된 기간(YYYY-MM-DD). 비어있으면 기간 제한 없음.
 
@@ -529,7 +537,7 @@ async function loadContracts() {
 }
 
 async function loadTabCounts() {
-  tabCounts = await api('/api/hub-items/counts').catch(() => ({ total: 0, byCode: {} }));
+  tabCounts = await api('/api/hub-items/counts').catch(() => ({ total: 0, byFilter: {} }));
 }
 
 // 탭은 등록된 필터 전체를 기준으로 만든다(허브 수집을 아직 안 돌린 필터도 0건 탭으로 보이게).
@@ -547,17 +555,40 @@ function renderContractTabs() {
   };
   makeTab('all', `전체 (${tabCounts.total})`);
   for (const f of allFilters) {
-    const count = f.item_code ? (tabCounts.byCode[f.item_code] || 0) : 0;
+    const count = tabCounts.byFilter[f.id] || 0;
     makeTab(f.id, `${f.keyword}${f.region ? ' · ' + f.region : ''} (${count})`);
   }
 }
 
+const escHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const cellHtml = (text, cls) =>
-  `<td${cls ? ' class="' + cls + '"' : ''} title="${(text ?? '').toString().replace(/"/g, '&quot;')}">${text ?? ''}</td>`;
+  `<td${cls ? ' class="' + cls + '"' : ''} title="${escHtml(text)}">${escHtml(text)}</td>`;
 const isNumCol = (name) => /단가|수량|금액/.test(name);
 
+// 머리글을 누르면 그 컬럼으로 정렬, 같은 컬럼을 다시 누르면 방향을 뒤집는다. 숫자·날짜는
+// 큰 값/최신부터(내림차순), 글자는 가나다순(오름차순)으로 시작한다.
 function setHeader(cols) {
-  document.getElementById('contract-thead').innerHTML = cols.map((c) => `<th>${c}</th>`).join('');
+  const tr = document.getElementById('contract-thead');
+  tr.innerHTML = '';
+  for (const c of cols) {
+    const th = document.createElement('th');
+    th.className = 'sortable' + (isNumCol(c) ? ' num' : '');
+    th.textContent = c;
+    if (c === sortCol) {
+      const ind = document.createElement('span');
+      ind.className = 'sort-ind';
+      ind.textContent = sortDir === 'asc' ? '▲' : '▼';
+      th.appendChild(ind);
+      th.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
+    }
+    th.onclick = () => {
+      if (sortCol === c) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortCol = c; sortDir = isNumCol(c) || c === '계약(납품요구)일자' ? 'desc' : 'asc'; }
+      currentPage = 1;
+      loadTablePage();
+    };
+    tr.appendChild(th);
+  }
 }
 
 // 선택된 탭의 세부품명번호에 해당하는 허브 데이터가 있으면 그걸(단가·수량 포함) 우선 보여준다.
@@ -567,10 +598,10 @@ function activeItemCode() {
   return f ? f.item_code : null;
 }
 
+// 탭이 가리키는 필터(품목번호+지역)는 서버가 filter id로 찾아서 적용한다("전체"는 내 필터 전부).
 async function loadTablePage() {
-  const code = activeItemCode();
-  const params = new URLSearchParams({ page: currentPage, pageSize: PAGE_SIZE });
-  if (code) params.set('code', code);
+  const params = new URLSearchParams({ page: currentPage, pageSize: PAGE_SIZE, sort: sortCol, dir: sortDir });
+  if (activeFilterId !== 'all') params.set('filter', activeFilterId);
   if (queryFrom) params.set('from', queryFrom.replace(/-/g, ''));
   if (queryTo) params.set('to', queryTo.replace(/-/g, ''));
   const data = await api('/api/hub-items?' + params.toString()).catch(() => ({ rows: [], total: 0 }));

@@ -373,32 +373,126 @@ function mergeCoverage(itemCode, newFrom, newTo) {
   for (const iv of merged) ins.run(itemCode, iv.from_date, iv.to_date);
 }
 
-// 조달데이터허브에서 긁어온 라인아이템. 필터 키워드(=세부품명)나 코드로 좁혀서 본다.
-// 기간(from/to)과 페이지(page/pageSize)로 서버 사이드 페이지네이션한다.
+// ─── 필터의 지역 조건 ─────────────────────────────────────
+// 지역은 수요기관 소재지("경기도 수원시 권선구", "충청남도 천안시")에 대해 맞춘다. 원본은
+// 정식 명칭이라 "충남"·"서울시"·"강원도" 같은 흔한 입력은 그대로는 안 걸려서 시도 약칭을 풀어준다.
+const SIDO_ALIASES = {};
+for (const [names, forms] of [
+  [['서울', '서울시', '서울특별시'], ['서울특별시']],
+  [['부산', '부산시', '부산광역시'], ['부산광역시']],
+  [['대구', '대구시', '대구광역시'], ['대구광역시']],
+  [['인천', '인천시', '인천광역시'], ['인천광역시']],
+  [['광주광역시'], ['광주광역시']], // "광주"만 쓰면 경기도 광주시도 걸리게 그대로 둔다
+  [['대전', '대전시', '대전광역시'], ['대전광역시']],
+  [['울산', '울산시', '울산광역시'], ['울산광역시']],
+  [['세종', '세종시', '세종특별자치시'], ['세종특별자치시']],
+  [['경기', '경기도'], ['경기도']],
+  [['강원', '강원도', '강원특별자치도'], ['강원특별자치도', '강원도']],
+  [['충북', '충청북도'], ['충청북도']],
+  [['충남', '충청남도'], ['충청남도']],
+  [['전북', '전라북도', '전북특별자치도'], ['전북특별자치도', '전라북도']],
+  [['전남', '전라남도'], ['전라남도']],
+  [['경북', '경상북도'], ['경상북도']],
+  [['경남', '경상남도'], ['경상남도']],
+  [['제주', '제주도', '제주특별자치도'], ['제주특별자치도', '제주도']],
+]) for (const n of names) SIDO_ALIASES[n] = forms;
+
+// "서울, 경기 수원" → [[["서울특별시"]], [["경기도"], ["수원"]]]
+// 쉼표로 나눈 묶음끼리는 OR, 묶음 안의 띄어쓴 단어들은 AND("경기 수원" = 경기도 수원시).
+// 단, 묶음이 시도 이름만으로 돼 있으면("서울 경기") 한 곳이 두 시도일 순 없으니 OR로 본다.
+// 단어 하나는 표기 후보들(전북특별자치도/전라북도 등) 중 아무거나 맞으면 된다.
+function parseRegion(region) {
+  const groups = [];
+  for (const term of String(region || '').split(/[,，/]+/)) {
+    const tokens = term.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    const forms = tokens.map((t) => SIDO_ALIASES[t] || [t]);
+    if (tokens.length > 1 && tokens.every((t) => SIDO_ALIASES[t])) forms.forEach((f) => groups.push([f]));
+    else groups.push(forms);
+  }
+  return groups;
+}
+
+const LOCATION_SQL = `json_extract(raw_json, '$."수요기관소재시군구"')`;
+function regionSql(region) {
+  const groups = parseRegion(region);
+  if (!groups.length) return null;
+  const params = [];
+  const like = (s) => { params.push(`%${s.replace(/[\\%_]/g, '\\$&')}%`); return `${LOCATION_SQL} LIKE ? ESCAPE '\\'`; };
+  const sql = groups.map((g) => `(${g.map((forms) => `(${forms.map(like).join(' OR ')})`).join(' AND ')})`).join(' OR ');
+  return { sql: `(${sql})`, params };
+}
+function regionMatcher(region) {
+  const groups = parseRegion(region);
+  if (!groups.length) return () => true;
+  return (row) => {
+    const loc = String(row['수요기관소재시군구'] || '');
+    return groups.some((g) => g.every((forms) => forms.some((f) => loc.includes(f))));
+  };
+}
+
+// 내 필터(세부품명번호 + 선택적 지역)를 hub_items WHERE 조건으로. filterId를 주면 그 필터
+// 하나만, 안 주면("전체" 탭) 내 필터 전부의 합집합. 걸 게 없으면 null.
+function myFiltersWhere(userId, filterId) {
+  const filters = filterId
+    ? db.prepare(`SELECT item_code, region FROM filters WHERE user_id = ? AND id = ? AND item_code IS NOT NULL`).all(userId, filterId)
+    : db.prepare(`SELECT item_code, region FROM filters WHERE user_id = ? AND item_code IS NOT NULL`).all(userId);
+  if (!filters.length) return null;
+  const params = [];
+  const parts = filters.map((f) => {
+    params.push(f.item_code);
+    const r = regionSql(f.region);
+    if (!r) return '(item_code = ?)';
+    params.push(...r.params);
+    return `(item_code = ? AND ${r.sql})`;
+  });
+  return { sql: `(${parts.join(' OR ')})`, params };
+}
+
+// 표 머리글 정렬: 화면의 컬럼명만 허용(그대로 SQL에 넣지 않고 JSON 경로는 바인딩으로 넘긴다).
+// 단가·수량·금액은 "255,400" 같은 문자열이라 쉼표를 빼고 숫자로 비교한다.
+const SORTABLE_COLS = new Set(['조달방식', '업무구분', '계약구분', '계약(납품요구)일자', '수요기관', '수요기관소재시군구',
+  '세부품명번호', '세부품명', '품목명', '업체명', '낙찰방법', '단위', '계약납품단가', '계약납품수량', '공급금액']);
+function orderBySql(col, dir) {
+  const d = dir === 'asc' ? 'ASC' : 'DESC';
+  const tiebreak = 'contract_date DESC, contract_no DESC, item_seq';
+  if (!SORTABLE_COLS.has(col) || col === '계약(납품요구)일자') return { sql: `contract_date ${d}, contract_no ${d}, item_seq`, params: [] };
+  const path = `$."${col}"`;
+  if (/단가|수량|금액/.test(col)) return { sql: `CAST(REPLACE(json_extract(raw_json, ?), ',', '') AS REAL) ${d}, ${tiebreak}`, params: [path] };
+  return { sql: `json_extract(raw_json, ?) ${d}, ${tiebreak}`, params: [path] };
+}
+
+// 조달데이터허브에서 긁어온 라인아이템을 내 필터(품목번호+지역)로 좁혀서 본다.
+// 기간(from/to)·정렬(sort/dir)·페이지(page/pageSize)는 서버에서 처리한다(페이지를 넘겨도 정렬 유지).
 app.get('/api/hub-items', (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const pageSize = Math.min(Math.max(1, Number(req.query.pageSize) || 20), 200);
-  const code = (req.query.code || '').trim();
+  const filterId = Number(req.query.filter) || null;
   const from = (req.query.from || '').trim();
   const to = (req.query.to || '').trim();
 
-  const conds = [], params = [];
-  if (code) { conds.push('item_code = ?'); params.push(code); }
+  const scope = myFiltersWhere(req.user.id, filterId);
+  if (!scope) return res.json({ rows: [], total: 0, page, pageSize });
+  const conds = [scope.sql], params = [...scope.params];
   if (from) { conds.push('contract_date >= ?'); params.push(from); }
   if (to) { conds.push('contract_date <= ?'); params.push(to); }
-  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+  const where = 'WHERE ' + conds.join(' AND ');
+  const order = orderBySql(req.query.sort, req.query.dir);
 
   const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${where}`).get(...params).c;
-  const rows = db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY contract_date DESC LIMIT ? OFFSET ?`)
-    .all(...params, pageSize, (page - 1) * pageSize);
+  const rows = db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY ${order.sql} LIMIT ? OFFSET ?`)
+    .all(...params, ...order.params, pageSize, (page - 1) * pageSize);
   res.json({ rows: rows.map((r) => JSON.parse(r.raw_json)), total, page, pageSize });
 });
 
-// 탭 라벨에 쓰는 품목별 전체 건수(기간 필터 없이) — 표 페이지네이션과 별개로 가볍게 조회.
+// 탭 라벨에 쓰는 필터별 전체 건수(기간 필터 없이, 지역 조건은 반영) — 표와 별개로 가볍게 조회.
 app.get('/api/hub-items/counts', (req, res) => {
-  const byCode = db.prepare(`SELECT item_code, COUNT(*) c FROM hub_items GROUP BY item_code`).all();
-  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items`).get().c;
-  res.json({ total, byCode: Object.fromEntries(byCode.map((r) => [r.item_code, r.c])) });
+  const count = (scope) => (scope ? db.prepare(`SELECT COUNT(*) c FROM hub_items WHERE ${scope.sql}`).get(...scope.params).c : 0);
+  const byFilter = {};
+  for (const f of db.prepare(`SELECT id FROM filters WHERE user_id = ?`).all(req.user.id)) {
+    byFilter[f.id] = count(myFiltersWhere(req.user.id, f.id));
+  }
+  res.json({ total: count(myFiltersWhere(req.user.id, null)), byFilter });
 });
 
 // 검색엔진용 공개 페이지(/, /items, /item/:code, robots.txt, sitemap.xml) — "/"를 static보다
@@ -518,16 +612,22 @@ function isRecentEnoughToNotify(row) {
 async function notifyAllUsersForCode(itemCode, rows) {
   const recent = rows.filter(isRecentEnoughToNotify);
   if (!recent.length) return;
-  const filters = db.prepare(`SELECT * FROM filters WHERE item_code = ?`).all(itemCode);
+  // 같은 사용자가 같은 품목에 지역만 다르게 필터를 여러 개 걸 수 있다 — 그중 하나라도
+  // 맞는 행만 모아서, 사용자당 알림은 한 번만 보낸다(지역이 안 맞으면 안 보냄).
   const byUser = new Map();
-  for (const f of filters) if (!byUser.has(f.user_id)) byUser.set(f.user_id, f);
-  if (!byUser.size) return;
-  const top = recent.slice(0, 3)
-    .map((r) => `${r['품목명'] || itemCode} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? Number(r['계약납품단가']).toLocaleString() + '원' : ''}`)
-    .join('\n');
-  for (const [userId, f] of byUser) {
+  for (const f of db.prepare(`SELECT * FROM filters WHERE item_code = ?`).all(itemCode)) {
+    const e = byUser.get(f.user_id) || { filter: f, matchers: [] };
+    e.matchers.push(regionMatcher(f.region));
+    byUser.set(f.user_id, e);
+  }
+  for (const [userId, { filter: f, matchers }] of byUser) {
+    const matched = recent.filter((r) => matchers.some((m) => m(r)));
+    if (!matched.length) continue;
+    const top = matched.slice(0, 3)
+      .map((r) => `${r['품목명'] || itemCode} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? r['계약납품단가'] + '원' : ''}`)
+      .join('\n');
     await sendPushToUser(userId, {
-      title: `나라장터 신규 계약 ${recent.length}건 - ${f.keyword}`,
+      title: `나라장터 신규 계약 ${matched.length}건 - ${f.keyword}${matchers.length === 1 && f.region ? ` · ${f.region}` : ''}`,
       body: top,
       url: '/',
     });
