@@ -63,7 +63,12 @@ a{color:var(--foreground);text-decoration:underline;text-underline-offset:2px;fo
 .tabs button.active{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
 table{width:100%;border-collapse:collapse;font-size:12px}
 thead th{background:transparent;color:var(--muted-foreground);font-weight:500;padding:8px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;text-align:left}
-thead th.sortable{cursor:pointer;user-select:none}
+thead th.sortable{cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:pan-y}
+thead th.dragging{opacity:.35}
+thead th.drop-before{box-shadow:inset 3px 0 0 var(--primary)}
+thead th.drop-after{box-shadow:inset -3px 0 0 var(--primary)}
+body.col-dragging,body.col-dragging *{cursor:grabbing !important}
+.linklike{background:none;border:none;color:var(--muted-foreground);font-size:12px;padding:0;text-decoration:underline;text-underline-offset:2px;cursor:pointer;flex:none}
 thead th.sortable:hover,thead th[aria-sort]{color:var(--foreground)}
 thead th.num{text-align:right}
 .sort-ind{font-size:9px;margin-left:4px}
@@ -254,7 +259,10 @@ html.authed #main-view{display:block}
           <div id="hub-progress-bar" style="background:#1c3f6e;height:100%;width:0%;transition:width .4s"></div>
         </div>
       </div>
-      <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+        <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
+        <button class="linklike" id="col-reset" style="display:none" onclick="resetColOrder()">열 순서 초기화</button>
+      </div>
       <div class="table-scroll">
         <table>
           <thead><tr id="contract-thead"></tr></thead>
@@ -565,14 +573,41 @@ const cellHtml = (text, cls) =>
   `<td${cls ? ' class="' + cls + '"' : ''} title="${escHtml(text)}">${escHtml(text)}</td>`;
 const isNumCol = (name) => /단가|수량|금액/.test(name);
 
-// 머리글을 누르면 그 컬럼으로 정렬, 같은 컬럼을 다시 누르면 방향을 뒤집는다. 숫자·날짜는
-// 큰 값/최신부터(내림차순), 글자는 가나다순(오름차순)으로 시작한다.
+// 컬럼 순서: 머리글을 끌어서 바꾸고, 이 기기(브라우저)에 저장한다. 저장된 순서에 없는 컬럼이
+// 나중에 생기면 맨 뒤에 붙이고, 없어진 컬럼은 버린다.
+const COL_ORDER_KEY = 'g2b.colOrder';
+function loadColOrder() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(COL_ORDER_KEY) || 'null');
+    if (Array.isArray(saved)) {
+      const kept = saved.filter((c) => HUB_COLS.includes(c));
+      return [...kept, ...HUB_COLS.filter((c) => !kept.includes(c))];
+    }
+  } catch (e) {}
+  return [...HUB_COLS];
+}
+let colOrder = loadColOrder();
+function saveColOrder() {
+  try { localStorage.setItem(COL_ORDER_KEY, JSON.stringify(colOrder)); } catch (e) {}
+}
+function resetColOrder() {
+  colOrder = [...HUB_COLS];
+  try { localStorage.removeItem(COL_ORDER_KEY); } catch (e) {}
+  renderTable(lastTableData);
+}
+
+// 머리글을 짧게 누르면 그 컬럼으로 정렬(다시 누르면 방향 반전, 숫자·날짜는 내림차순·글자는
+// 가나다순으로 시작). 누른 채 옆으로 끌면 컬럼 위치를 옮긴다 — 마우스·터치 둘 다 되게 pointer
+// 이벤트로 처리하고, 8px 넘게 움직였을 때만 끌기로 본다(그 아래는 그냥 클릭).
+let suppressHeaderClick = false;
 function setHeader(cols) {
   const tr = document.getElementById('contract-thead');
   tr.innerHTML = '';
   for (const c of cols) {
     const th = document.createElement('th');
     th.className = 'sortable' + (isNumCol(c) ? ' num' : '');
+    th.dataset.col = c;
+    th.title = '클릭: 정렬 · 끌기: 위치 이동';
     th.textContent = c;
     if (c === sortCol) {
       const ind = document.createElement('span');
@@ -582,13 +617,72 @@ function setHeader(cols) {
       th.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
     }
     th.onclick = () => {
+      if (suppressHeaderClick) return;
       if (sortCol === c) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
       else { sortCol = c; sortDir = isNumCol(c) || c === '계약(납품요구)일자' ? 'desc' : 'asc'; }
       currentPage = 1;
       loadTablePage();
     };
+    th.addEventListener('pointerdown', (e) => startColumnDrag(e, th, c));
     tr.appendChild(th);
   }
+}
+
+function startColumnDrag(e, th, col) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const startX = e.clientX;
+  const scroller = th.closest('.table-scroll');
+  let dragging = false, target = null, after = false;
+  const clearMarks = () => document.querySelectorAll('#contract-thead th.drop-before, #contract-thead th.drop-after')
+    .forEach((x) => x.classList.remove('drop-before', 'drop-after'));
+
+  const move = (ev) => {
+    if (!dragging) {
+      if (Math.abs(ev.clientX - startX) < 8) return;
+      dragging = true;
+      th.classList.add('dragging');
+      document.body.classList.add('col-dragging');
+      try { th.setPointerCapture(ev.pointerId); } catch (err) {}
+    }
+    ev.preventDefault();
+    // 표가 옆으로 길어서, 표 가장자리 근처로 끌면 그쪽으로 스크롤해 준다
+    if (scroller) {
+      const box = scroller.getBoundingClientRect();
+      if (ev.clientX > box.right - 48) scroller.scrollLeft += 16;
+      else if (ev.clientX < box.left + 48) scroller.scrollLeft -= 16;
+    }
+    // 포인터 아래 머리글의 왼쪽/오른쪽 절반으로 그 앞·뒤 중 어디에 넣을지 정한다
+    clearMarks();
+    const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest('#contract-thead th');
+    if (over && over !== th) {
+      const r = over.getBoundingClientRect();
+      after = ev.clientX > r.left + r.width / 2;
+      over.classList.add(after ? 'drop-after' : 'drop-before');
+      target = over.dataset.col;
+    } else target = null;
+  };
+  const end = () => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', end);
+    document.removeEventListener('pointercancel', end);
+    if (!dragging) return; // 그냥 클릭 → th.onclick(정렬)
+    th.classList.remove('dragging');
+    document.body.classList.remove('col-dragging');
+    clearMarks();
+    // 끌기를 끝낸 자리에서 따라오는 click이 정렬로 처리되지 않게 한 번 막는다
+    suppressHeaderClick = true;
+    setTimeout(() => { suppressHeaderClick = false; }, 0);
+    if (!target || target === col) return;
+    const keepScroll = scroller ? scroller.scrollLeft : 0;
+    colOrder.splice(colOrder.indexOf(col), 1);
+    colOrder.splice(colOrder.indexOf(target) + (after ? 1 : 0), 0, col);
+    saveColOrder();
+    renderTable(lastTableData);
+    if (scroller) scroller.scrollLeft = keepScroll;
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', end);
+  document.addEventListener('pointercancel', end);
 }
 
 // 선택된 탭의 세부품명번호에 해당하는 허브 데이터가 있으면 그걸(단가·수량 포함) 우선 보여준다.
@@ -608,7 +702,11 @@ async function loadTablePage() {
   renderTable(data);
 }
 
-function renderTable({ rows, total }) {
+let lastTableData = { rows: [], total: 0 }; // 컬럼만 옮길 때 다시 조회하지 않고 다시 그리려고 들고 있는다
+
+function renderTable(data) {
+  const { rows, total } = data;
+  lastTableData = data;
   const tbody = document.getElementById('contract-tbody');
   const empty = document.getElementById('contract-empty');
   const pill = document.getElementById('hub-pill');
@@ -616,7 +714,8 @@ function renderTable({ rows, total }) {
   const pager = document.getElementById('pager');
   tbody.innerHTML = '';
 
-  setHeader(HUB_COLS);
+  setHeader(colOrder);
+  document.getElementById('col-reset').style.display = colOrder.join() === HUB_COLS.join() ? 'none' : '';
   empty.style.display = rows.length ? 'none' : 'block';
   if (total) {
     pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
@@ -627,7 +726,7 @@ function renderTable({ rows, total }) {
   }
   for (const h of rows) {
     const tr = document.createElement('tr');
-    tr.innerHTML = HUB_COLS.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
+    tr.innerHTML = colOrder.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
     tbody.appendChild(tr);
   }
 
