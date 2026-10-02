@@ -235,13 +235,15 @@ html.authed #main-view{display:block}
     </div>
 
     <div class="card" id="settings-panel" style="display:none">
-      <h2>data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
-      <label>공공데이터포털에서 발급받은 "조달청_물품목록정보서비스" 인증키(Decoding) — 품목 검색에 쓰입니다</label>
-      <input type="password" id="service-key" placeholder="서비스키 입력">
-      <button onclick="saveServiceKey()">저장</button>
-      <div class="err" id="key-err"></div>
+      <div id="admin-key" style="display:none;margin-bottom:16px">
+        <h2>data.go.kr 서비스키 <span class="pill" id="key-pill">확인 중</span></h2>
+        <label>공공데이터포털에서 발급받은 "조달청_물품목록정보서비스" 인증키(Decoding) — 모든 사용자의 품목 검색에 쓰이는 앱 공용 설정이라 관리자 계정에만 보입니다</label>
+        <input type="password" id="service-key" placeholder="서비스키 입력">
+        <button onclick="saveServiceKey()">저장</button>
+        <div class="err" id="key-err"></div>
+      </div>
 
-      <h2 style="margin-top:16px">비밀번호 변경</h2>
+      <h2>비밀번호 변경</h2>
       <input type="password" id="current-password" placeholder="현재 비밀번호">
       <input type="password" id="new-password" placeholder="새 비밀번호">
       <input type="password" id="new-password-confirm" placeholder="새 비밀번호 확인">
@@ -431,6 +433,7 @@ function initQueryDates() {
 
 async function loadSettings() {
   const s = await api('/api/settings');
+  document.getElementById('admin-key').style.display = s.isAdmin ? '' : 'none';
   const pill = document.getElementById('key-pill');
   pill.textContent = s.hasServiceKey ? '등록됨' : '미등록';
   pill.className = 'pill ' + (s.hasServiceKey ? 'ok' : 'warn');

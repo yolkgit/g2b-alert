@@ -239,8 +239,15 @@ app.use((req, res, next) => {
 });
 
 // ─── 설정 / 필터 ──────────────────────────────────────────
+// 서비스키처럼 앱 전체에 걸린 설정은 관리자(기본 'admin', 계정 도입 전 공유 비밀번호가 옮겨간 계정)만
+// 바꿀 수 있다. 가입이 열려 있어서 아무나 계정을 만들 수 있으므로, 일반 계정이 덮어쓰면 모든 사용자의
+// 품목 검색이 같이 망가진다.
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const isAdmin = (user) => user.username === ADMIN_USERNAME;
+
 app.get('/api/settings', (req, res) => {
   res.json({
+    isAdmin: isAdmin(req.user),
     hasServiceKey: !!getSetting('g2b_service_key'),
     vapidPublicKey: getSetting('vapid_public'),
     alarmTime: req.user.alarm_time,
@@ -249,6 +256,7 @@ app.get('/api/settings', (req, res) => {
   });
 });
 app.post('/api/settings/service-key', (req, res) => {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: '관리자만 바꿀 수 있습니다' });
   const { serviceKey } = req.body || {};
   if (!serviceKey) return res.status(400).json({ error: 'serviceKey 필요' });
   setSetting('g2b_service_key', serviceKey);
