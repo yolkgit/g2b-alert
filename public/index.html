@@ -69,6 +69,27 @@ a{color:var(--foreground);text-decoration:underline;text-underline-offset:2px;fo
 table{width:100%;border-collapse:collapse;font-size:12px}
 thead th{background:transparent;color:var(--muted-foreground);font-weight:500;padding:8px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;text-align:left}
 thead th.sortable{cursor:pointer;user-select:none;-webkit-user-select:none;touch-action:pan-y}
+/* 머리글 ▾ 메뉴(엑셀 열 필터처럼): 정렬 + 값 체크박스. 기본 button 스타일(검정 채움)을 덮어쓴다 */
+.th-menu{background:transparent;border:none;color:var(--muted-foreground);padding:1px 4px;margin-left:2px;font-size:10px;line-height:1.4;border-radius:4px;font-weight:400;vertical-align:middle;min-width:20px;min-height:20px}
+.th-menu:hover{background:var(--border);color:var(--foreground);opacity:1}
+.th-menu.on{background:var(--primary);color:var(--primary-foreground)}
+.colmenu{position:fixed;z-index:60;width:300px;max-width:calc(100vw - 16px);background:var(--card);border:1px solid var(--border);border-radius:calc(var(--radius) + 2px);box-shadow:0 10px 30px rgb(0 0 0 / .18);padding:12px;display:flex;flex-direction:column;gap:8px;max-height:min(82vh,540px);word-break:keep-all}
+.colmenu .cm-head{font-size:13px;font-weight:600}
+.cm-sort{display:flex;gap:6px}
+.cm-sort button{flex:1;padding:6px 8px;font-size:12px}
+.colmenu .cm-search{margin:0;padding:7px 10px;font-size:12px}
+.cm-list{overflow:auto;border:1px solid var(--border);border-radius:calc(var(--radius) - 2px);min-height:64px;max-height:250px}
+.cm-row{display:flex;gap:8px;align-items:center;padding:6px 10px;font-size:12px;cursor:pointer;margin:0;color:var(--foreground);user-select:none;-webkit-user-select:none}
+.cm-row:hover{background:var(--muted)}
+.cm-row input{width:auto;margin:0;padding:0;flex:none}
+.cm-row .v{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cm-row .n{flex:none;color:var(--muted-foreground);font-variant-numeric:tabular-nums}
+.cm-row.cm-all{border-bottom:1px solid var(--border);font-weight:600;position:sticky;top:0;background:var(--card)}
+.cm-empty{padding:14px 10px;font-size:12px;color:var(--muted-foreground);text-align:center}
+.cm-foot{display:flex;gap:8px;align-items:center}
+.cm-foot .cm-info{flex:1;font-size:11px;color:var(--muted-foreground);min-width:0}
+.cm-foot button{padding:6px 12px;font-size:12px}
+@media (max-width:600px){.colmenu{left:8px !important;right:8px;bottom:8px;top:auto !important;width:auto;max-width:none}}
 thead th.dragging{opacity:.35}
 thead th.drop-before{box-shadow:inset 3px 0 0 var(--primary)}
 thead th.drop-after{box-shadow:inset -3px 0 0 var(--primary)}
@@ -288,6 +309,7 @@ html.authed #main-view{display:block}
           <button class="secondary" id="excel-btn" style="display:none;flex:none;padding:5px 12px;font-size:12px" onclick="downloadExcel()">엑셀 저장</button>
         </div>
       </div>
+      <div id="col-chips" class="filter-tags" style="display:none;margin-bottom:8px;align-items:center"></div>
       <div class="table-scroll">
         <table>
           <thead><tr id="contract-thead"></tr></thead>
@@ -594,6 +616,7 @@ let activeFilterId = 'all';
 let tabCounts = { total: 0, byFilter: {} }; // 탭 라벨용 필터별 전체 건수(기간 필터와 무관, 지역은 반영)
 let currentPage = 1;
 let sortCol = '계약(납품요구)일자', sortDir = 'desc'; // 표 머리글 클릭 정렬(서버에서 전체 기준으로 정렬)
+let colFilters = {}; // 머리글 ▾ 메뉴로 고른 컬럼별 값 필터 { 컬럼명: [값…] } — 서버가 전체 기준으로 걸러준다. 탭을 바꾸면 비운다
 const PAGE_SIZE = 20;
 let queryFrom = '', queryTo = ''; // "조회" 버튼으로 적용된 기간(YYYY-MM-DD). 비어있으면 기간 제한 없음.
 
@@ -614,13 +637,13 @@ async function loadTabCounts() {
 function renderContractTabs() {
   const tabs = document.getElementById('contract-tabs');
   const validIds = new Set(allFilters.map((f) => f.id));
-  if (!validIds.has(activeFilterId) && activeFilterId !== 'all') activeFilterId = 'all';
+  if (!validIds.has(activeFilterId) && activeFilterId !== 'all') { activeFilterId = 'all'; colFilters = {}; }
   tabs.innerHTML = '';
   const makeTab = (id, label) => {
     const btn = document.createElement('button');
     btn.textContent = label;
     btn.className = id === activeFilterId ? 'active' : '';
-    btn.onclick = () => { activeFilterId = id; currentPage = 1; renderContractTabs(); loadTablePage(); };
+    btn.onclick = () => { activeFilterId = id; colFilters = {}; currentPage = 1; renderContractTabs(); loadTablePage(); };
     tabs.appendChild(btn);
   };
   makeTab('all', `전체 (${tabCounts.total})`);
@@ -678,6 +701,14 @@ function setHeader(cols) {
       th.appendChild(ind);
       th.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
     }
+    const mb = document.createElement('button');
+    mb.type = 'button';
+    mb.className = 'th-menu' + (colFilters[c] ? ' on' : '');
+    mb.textContent = '▾';
+    mb.title = colFilters[c] ? c + ' — 필터 적용 중' : c + ' 정렬·필터';
+    mb.setAttribute('aria-haspopup', 'dialog');
+    mb.onclick = (e) => { e.stopPropagation(); (colMenuEl && colMenuEl.dataset.col === c) ? closeColMenu() : openColMenu(c, th); };
+    th.appendChild(mb);
     th.onclick = () => {
       if (suppressHeaderClick) return;
       if (sortCol === c) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
@@ -755,16 +786,198 @@ function activeItemCode() {
 }
 
 // 탭이 가리키는 필터(품목번호+지역)는 서버가 filter id로 찾아서 적용한다("전체"는 내 필터 전부).
-async function loadTablePage() {
-  const params = new URLSearchParams({ page: currentPage, pageSize: PAGE_SIZE, sort: sortCol, dir: sortDir });
-  if (activeFilterId !== 'all') params.set('filter', activeFilterId);
-  if (queryFrom) params.set('from', queryFrom.replace(/-/g, ''));
-  if (queryTo) params.set('to', queryTo.replace(/-/g, ''));
-  const data = await api('/api/hub-items?' + params.toString()).catch(() => ({ rows: [], total: 0 }));
-  renderTable(data);
+// ─── 머리글 ▾ 메뉴: 정렬 + 그 컬럼에 실제로 있는 값의 체크박스(엑셀 열 필터처럼) ───────────
+// 값 목록은 서버가 "지금 보는 범위(탭·기간·다른 컬럼 필터)"에서 세어 준다. 체크하고 [적용]을 누르면
+// 고른 값만 서버에서 걸러 목록·페이지·엑셀에 모두 반영된다. 값은 DB/사용자 데이터라 textContent로만 넣는다.
+let colMenuEl = null;
+const EMPTY_LABEL = '(빈 값)';
+const isNarrow = () => window.innerWidth <= 600;
+function closeColMenu() { if (colMenuEl) { colMenuEl.remove(); colMenuEl = null; } }
+document.addEventListener('pointerdown', (e) => {
+  if (colMenuEl && !colMenuEl.contains(e.target) && !e.target.closest('.th-menu')) closeColMenu();
+}, true);
+window.addEventListener('resize', closeColMenu);
+window.addEventListener('scroll', () => { if (colMenuEl && !isNarrow()) closeColMenu(); }, { passive: true });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeColMenu(); });
+
+function setSort(col, dir) {
+  sortCol = col; sortDir = dir; currentPage = 1;
+  closeColMenu();
+  loadTablePage();
 }
 
-let lastTableData = { rows: [], total: 0 }; // 컬럼만 옮길 때 다시 조회하지 않고 다시 그리려고 들고 있는다
+async function openColMenu(col, th) {
+  closeColMenu();
+  const menu = document.createElement('div');
+  menu.className = 'colmenu';
+  menu.dataset.col = col;
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', `${col} 정렬·필터`);
+  colMenuEl = menu;
+  const el = (tag, cls, text) => { const x = document.createElement(tag); if (cls) x.className = cls; if (text != null) x.textContent = text; return x; };
+
+  menu.appendChild(el('div', 'cm-head', col));
+  const sortRow = el('div', 'cm-sort');
+  for (const [dir, label] of [['asc', '↑ 오름차순'], ['desc', '↓ 내림차순']]) {
+    const b = el('button', sortCol === col && sortDir === dir ? '' : 'secondary', label);
+    b.type = 'button';
+    b.onclick = () => setSort(col, dir);
+    sortRow.appendChild(b);
+  }
+  menu.appendChild(sortRow);
+
+  const search = el('input', 'cm-search');
+  search.type = 'search';
+  search.placeholder = '값 검색';
+  menu.appendChild(search);
+  const list = el('div', 'cm-list');
+  menu.appendChild(list);
+  const foot = el('div', 'cm-foot');
+  const info = el('span', 'cm-info');
+  const clearBtn = el('button', 'secondary', '초기화');
+  const applyBtn = el('button', '', '적용');
+  clearBtn.type = applyBtn.type = 'button';
+  foot.append(info, clearBtn, applyBtn);
+  menu.appendChild(foot);
+  document.body.appendChild(menu);
+
+  const place = () => {
+    if (isNarrow()) { menu.style.left = menu.style.top = ''; return; }
+    const r = th.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    menu.style.left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8) + 'px';
+    menu.style.top = Math.max(8, Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+  };
+  place();
+  list.appendChild(el('div', 'cm-empty', '값을 불러오는 중...'));
+
+  const state = { values: [], truncated: false, selected: new Set(), needle: '' };
+  const label = (v) => (v === '' ? EMPTY_LABEL : v);
+  const fetchValues = async (q) => {
+    const d = await api('/api/hub-items/values', { method: 'POST', body: JSON.stringify({ ...tableRequest(), col, q: q || '' }) });
+    if (colMenuEl !== menu) return null; // 그새 닫혔거나 다른 메뉴가 열림
+    return d;
+  };
+  const visible = () => {
+    if (state.truncated) return state.values; // 너무 많으면 서버가 검색어로 이미 좁혀 줌
+    const n = state.needle.toLowerCase();
+    return n ? state.values.filter((x) => label(x.v).toLowerCase().includes(n)) : state.values;
+  };
+
+  const paint = () => {
+    const vis = visible();
+    list.innerHTML = '';
+    if (!vis.length) { list.appendChild(el('div', 'cm-empty', state.needle ? '검색 결과가 없어요' : '값이 없어요')); }
+    else {
+      const allRow = el('label', 'cm-row cm-all');
+      const allBox = el('input'); allBox.type = 'checkbox';
+      const nSel = vis.filter((x) => state.selected.has(x.v)).length;
+      allBox.checked = nSel === vis.length; allBox.indeterminate = nSel > 0 && nSel < vis.length;
+      allBox.onchange = () => { for (const x of vis) (allBox.checked ? state.selected.add(x.v) : state.selected.delete(x.v)); paint(); };
+      allRow.append(allBox, el('span', 'v', state.needle ? '(검색 결과 전체 선택)' : '(전체 선택)'));
+      list.appendChild(allRow);
+      for (const x of vis) {
+        const row = el('label', 'cm-row');
+        const box = el('input'); box.type = 'checkbox'; box.checked = state.selected.has(x.v);
+        box.onchange = () => { box.checked ? state.selected.add(x.v) : state.selected.delete(x.v); paintFoot(); syncAll(); };
+        const v = el('span', 'v', label(x.v)); v.title = label(x.v);
+        row.append(box, v, el('span', 'n', String(x.n)));
+        list.appendChild(row);
+      }
+    }
+    paintFoot();
+  };
+  // 개별 체크를 바꿀 때는 목록을 다시 그리지 않고 "전체 선택" 상태와 하단 문구만 갱신(스크롤 위치 유지)
+  const syncAll = () => {
+    const allBox = list.querySelector('.cm-all input');
+    if (!allBox) return;
+    const vis = visible();
+    const nSel = vis.filter((x) => state.selected.has(x.v)).length;
+    allBox.checked = nSel === vis.length; allBox.indeterminate = nSel > 0 && nSel < vis.length;
+  };
+  const paintFoot = () => {
+    const n = state.selected.size;
+    info.textContent = state.truncated ? `${n}개 선택 · 값이 많아 일부만 보여요. 검색해서 고르세요` : `${n}개 선택`;
+    applyBtn.disabled = n === 0;
+  };
+
+  search.addEventListener('input', () => {
+    state.needle = search.value.trim();
+    if (!state.truncated) return paint();
+    clearTimeout(search._t);
+    search._t = setTimeout(async () => {
+      const d = await fetchValues(state.needle).catch(() => null);
+      if (d) { state.values = d.values; state.truncated = d.truncated; paint(); }
+    }, 250);
+  });
+  clearBtn.onclick = () => { delete colFilters[col]; currentPage = 1; closeColMenu(); loadTablePage(); };
+  applyBtn.onclick = () => {
+    if (!state.selected.size) return;
+    const all = !state.truncated && state.values.length === state.selected.size && state.values.every((x) => state.selected.has(x.v));
+    if (all) delete colFilters[col]; // 전부 선택 = 필터 없음
+    else colFilters[col] = [...state.selected];
+    currentPage = 1; closeColMenu(); loadTablePage();
+  };
+
+  try {
+    const d = await fetchValues('');
+    if (!d) return;
+    state.values = d.values; state.truncated = d.truncated;
+    const existing = colFilters[col];
+    if (existing) state.selected = new Set(state.truncated ? existing : existing.filter((v) => state.values.some((x) => x.v === v)));
+    else if (!state.truncated) state.selected = new Set(state.values.map((x) => x.v)); // 필터가 없으면 전부 체크된 상태에서 시작
+    paint();
+    place(); // 목록 길이에 맞춰 화면 아래로 안 잘리게 다시 맞춤
+    if (window.matchMedia('(pointer:fine)').matches) search.focus();
+  } catch (e) {
+    if (colMenuEl === menu) { list.innerHTML = ''; list.appendChild(el('div', 'cm-empty', '값을 불러오지 못했어요: ' + e.message)); }
+  }
+}
+
+// 표 위에 "지금 걸린 컬럼 필터"를 칩으로 보여주고, ×로 하나씩 / 모두 해제
+function renderColChips() {
+  const box = document.getElementById('col-chips');
+  const cols = Object.keys(colFilters);
+  box.innerHTML = '';
+  box.style.display = cols.length ? 'flex' : 'none';
+  const short = (v) => { const t = v === '' ? EMPTY_LABEL : v; return t.length > 18 ? t.slice(0, 17) + '…' : t; };
+  for (const c of cols) {
+    const vals = colFilters[c];
+    const tag = document.createElement('span');
+    tag.className = 'filter-tag';
+    const txt = document.createElement('span');
+    txt.textContent = `${c}: ${vals.length <= 2 ? vals.map(short).join(', ') : vals.length + '개 선택'}`;
+    txt.title = vals.map((v) => (v === '' ? EMPTY_LABEL : v)).join('\n');
+    const del = document.createElement('button');
+    del.textContent = '×'; del.title = '이 필터 해제';
+    del.onclick = () => { delete colFilters[c]; currentPage = 1; loadTablePage(); };
+    tag.append(txt, del);
+    box.appendChild(tag);
+  }
+  if (cols.length > 1) {
+    const all = document.createElement('button');
+    all.className = 'linklike'; all.textContent = '필터 모두 해제';
+    all.onclick = () => { colFilters = {}; currentPage = 1; loadTablePage(); };
+    box.appendChild(all);
+  }
+}
+
+// 화면이 지금 보고 있는 조건 전부(탭·기간·컬럼 값 필터·정렬). 목록·값 목록·엑셀이 같은 걸 보낸다.
+// 값 필터를 많이 고르면 GET 주소가 너무 길어져서 POST 본문으로 보낸다.
+function tableRequest() {
+  return {
+    sort: sortCol, dir: sortDir,
+    filter: activeFilterId === 'all' ? null : activeFilterId,
+    from: queryFrom.replace(/-/g, ''), to: queryTo.replace(/-/g, ''),
+    cf: colFilters,
+  };
+}
+
+async function loadTablePage() {
+  const data = await api('/api/hub-items', { method: 'POST', body: JSON.stringify({ ...tableRequest(), page: currentPage, pageSize: PAGE_SIZE }) })
+    .catch(() => ({ rows: [], total: 0 }));
+  renderTable(data);
+}
 
 function renderTable(data) {
   const { rows, total } = data;
@@ -777,6 +990,7 @@ function renderTable(data) {
   tbody.innerHTML = '';
 
   setHeader(colOrder);
+  renderColChips();
   document.getElementById('col-reset').style.display = colOrder.join() === HUB_COLS.join() ? 'none' : '';
   const excelBtn = document.getElementById('excel-btn');
   excelBtn.style.display = total ? '' : 'none';
@@ -803,17 +1017,22 @@ function renderTable(data) {
 }
 
 // 지금 보이는 목록(탭·기간·정렬·컬럼 순서 그대로)을 페이지 구분 없이 전부 엑셀로 받는다.
-function downloadExcel() {
-  const params = new URLSearchParams({ sort: sortCol, dir: sortDir, cols: colOrder.join(',') });
-  if (activeFilterId !== 'all') params.set('filter', activeFilterId);
-  if (queryFrom) params.set('from', queryFrom.replace(/-/g, ''));
-  if (queryTo) params.set('to', queryTo.replace(/-/g, ''));
-  const a = document.createElement('a');
-  a.href = '/api/hub-items/export?' + params.toString();
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+async function downloadExcel() {
+  const btn = document.getElementById('excel-btn');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = '파일 만드는 중...';
+  try {
+    const res = await fetch('/api/hub-items/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...tableRequest(), cols: colOrder }) });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+    const blob = await res.blob();
+    const m = (res.headers.get('Content-Disposition') || '').match(/filename\*=UTF-8''([^;]+)/);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = m ? decodeURIComponent(m[1]) : '나라장터_조달내역.xlsx';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) { alert('엑셀 저장 실패: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = label; }
 }
 
 function gotoPage(p) {

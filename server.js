@@ -507,34 +507,104 @@ const toDisplayRow = (rawJson) => { const j = JSON.parse(rawJson); j['품목명'
 // sort()는 안정 정렬이라 같은 이름끼리는 SQL이 준 최신 계약순이 유지된다.
 const sortByDisplayName = (rows, dir) => rows.sort((a, b) => (dir === 'asc' ? 1 : -1) * String(a['품목명']).localeCompare(String(b['품목명']), 'ko'));
 
-// 조달데이터허브에서 긁어온 라인아이템을 내 필터(품목번호+지역)로 좁혀서 본다.
-// 기간(from/to)·정렬(sort/dir)·페이지(page/pageSize)는 서버에서 처리한다(페이지를 넘겨도 정렬 유지).
-app.get('/api/hub-items', (req, res) => {
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const pageSize = Math.min(Math.max(1, Number(req.query.pageSize) || 20), 200);
-  const filterId = Number(req.query.filter) || null;
-  const from = (req.query.from || '').trim();
-  const to = (req.query.to || '').trim();
+// ─── 표 머리글 값 필터(엑셀의 열 필터처럼) ────────────────────
+// cf = { 컬럼명: [허용할 값…] } — 화면 컬럼명 화이트리스트만 받고 값은 문자열로. 컬럼당 최대 1000개.
+// 빈 배열은 "아무것도 선택 안 함"이라 아무 행도 안 맞는 걸로 본다. 빈 값은 ''로 통일(없는 키 = 빈 문자열).
+// GET은 cf를 JSON 문자열로, POST는 객체로 받는다(값을 많이 고르면 URL이 너무 길어져서 POST를 쓴다).
+function parseColFilters(cf) {
+  if (typeof cf === 'string') { try { cf = JSON.parse(cf); } catch (e) { return {}; } }
+  const out = {};
+  if (!cf || typeof cf !== 'object' || Array.isArray(cf)) return out;
+  for (const [col, vals] of Object.entries(cf)) {
+    if (!SORTABLE_COLS.has(col) || !Array.isArray(vals)) continue;
+    out[col] = [...new Set(vals.slice(0, 1000).map((v) => String(v ?? '')))];
+  }
+  return out;
+}
+const colExpr = `COALESCE(json_extract(raw_json, ?), '')`;
 
-  const scope = myFiltersWhere(req.user.id, filterId);
-  if (!scope) return res.json({ rows: [], total: 0, page, pageSize });
+// 내 필터(탭) + 기간 + 컬럼 값 필터를 WHERE로. skipCol은 그 컬럼 자신의 필터는 빼고(값 목록용 —
+// 그래야 이미 고른 값도 목록에 남아 다시 바꿀 수 있다). 품목명은 화면에 보이는(정리된) 이름 기준이라
+// SQL로 못 걸러서 nameSet으로 돌려주고 호출한 쪽이 JS에서 거른다. 탭에 걸 필터가 없으면 null.
+function buildHubQuery(userId, q, skipCol) {
+  const scope = myFiltersWhere(userId, Number(q.filter) || null);
+  if (!scope) return null;
   const conds = [scope.sql], params = [...scope.params];
+  const from = String(q.from || '').trim(), to = String(q.to || '').trim();
   if (from) { conds.push('contract_date >= ?'); params.push(from); }
   if (to) { conds.push('contract_date <= ?'); params.push(to); }
-  const where = 'WHERE ' + conds.join(' AND ');
-  const order = orderBySql(req.query.sort, req.query.dir);
-
-  const offset = (page - 1) * pageSize;
-  if (req.query.sort === '품목명') {
-    const all = sortByDisplayName(
-      db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY contract_date DESC, contract_no DESC, item_seq`).all(...params).map((r) => toDisplayRow(r.raw_json)),
-      req.query.dir);
-    return res.json({ rows: all.slice(offset, offset + pageSize), total: all.length, page, pageSize });
+  let nameSet = null;
+  for (const [col, vals] of Object.entries(parseColFilters(q.cf))) {
+    if (col === skipCol) continue;
+    if (col === '품목명') { nameSet = new Set(vals); continue; }
+    if (!vals.length) { conds.push('0'); continue; }
+    conds.push(`${colExpr} IN (${vals.map(() => '?').join(',')})`);
+    params.push(`$."${col}"`, ...vals);
   }
-  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${where}`).get(...params).c;
-  const rows = db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY ${order.sql} LIMIT ? OFFSET ?`)
-    .all(...params, ...order.params, pageSize, offset);
-  res.json({ rows: rows.map((r) => toDisplayRow(r.raw_json)), total, page, pageSize });
+  return { where: 'WHERE ' + conds.join(' AND '), params, nameSet };
+}
+
+// 화면 목록·엑셀이 같이 쓰는 조회. 정렬은 SQL로 하고, 품목명으로 정렬하거나 거를 때만(화면에 보이는
+// 이름이 SQL에 없어서) 행을 모두 읽어 JS에서 처리한다. 반환 rows는 offset부터 limit개의 표시용 행.
+function queryHubRows(userId, q, offset, limit) {
+  const bq = buildHubQuery(userId, q);
+  if (!bq) return { rows: [], total: 0 };
+  const byName = q.sort === '품목명';
+  if (byName || bq.nameSet) {
+    const order = byName ? { sql: 'contract_date DESC, contract_no DESC, item_seq', params: [] } : orderBySql(q.sort, q.dir);
+    let all = db.prepare(`SELECT raw_json FROM hub_items ${bq.where} ORDER BY ${order.sql}`).all(...bq.params, ...order.params)
+      .map((r) => toDisplayRow(r.raw_json));
+    if (bq.nameSet) all = all.filter((r) => bq.nameSet.has(r['품목명']));
+    if (byName) sortByDisplayName(all, q.dir);
+    return { rows: all.slice(offset, offset + limit), total: all.length };
+  }
+  const order = orderBySql(q.sort, q.dir);
+  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${bq.where}`).get(...bq.params).c;
+  const rows = db.prepare(`SELECT raw_json FROM hub_items ${bq.where} ORDER BY ${order.sql} LIMIT ? OFFSET ?`)
+    .all(...bq.params, ...order.params, limit, offset).map((r) => toDisplayRow(r.raw_json));
+  return { rows, total };
+}
+
+// 조달데이터허브에서 긁어온 라인아이템을 내 필터(품목번호+지역)로 좁혀서 본다.
+// 기간(from/to)·컬럼 값 필터(cf)·정렬(sort/dir)·페이지(page/pageSize)는 서버에서 처리한다(페이지를 넘겨도 유지).
+const hubItemsHandler = (req, res) => {
+  const q = req.method === 'POST' ? req.body || {} : req.query;
+  const page = Math.max(1, Number(q.page) || 1);
+  const pageSize = Math.min(Math.max(1, Number(q.pageSize) || 20), 200);
+  const { rows, total } = queryHubRows(req.user.id, q, (page - 1) * pageSize, pageSize);
+  res.json({ rows, total, page, pageSize });
+};
+app.get('/api/hub-items', hubItemsHandler);
+app.post('/api/hub-items', hubItemsHandler);
+
+// 머리글 메뉴의 체크박스 목록: 지금 보고 있는 범위(탭·기간·다른 컬럼의 필터)에서 그 컬럼에 실제로 있는
+// 값과 건수. 자기 컬럼 필터는 빼고 센다. q는 값 검색어, 너무 많으면(1000개 초과) truncated로 알린다.
+const VALUES_MAX = 1000;
+app.post('/api/hub-items/values', (req, res) => {
+  const q = req.body || {};
+  const col = String(q.col || '');
+  if (!SORTABLE_COLS.has(col)) return res.status(400).json({ error: '알 수 없는 컬럼' });
+  const bq = buildHubQuery(req.user.id, q, col);
+  if (!bq) return res.json({ values: [], total: 0, truncated: false });
+
+  let counts;
+  if (col === '품목명') {
+    counts = new Map();
+    for (const r of db.prepare(`SELECT raw_json FROM hub_items ${bq.where}`).all(...bq.params)) {
+      const v = toDisplayRow(r.raw_json)['품목명'];
+      counts.set(v, (counts.get(v) || 0) + 1);
+    }
+  } else {
+    counts = new Map(db.prepare(`SELECT ${colExpr} v, COUNT(*) n FROM hub_items ${bq.where} GROUP BY v`)
+      .all(`$."${col}"`, ...bq.params).map((r) => [r.v, r.n]));
+  }
+  let values = [...counts].map(([v, n]) => ({ v, n }));
+  const needle = String(q.q || '').trim().toLowerCase();
+  if (needle) values = values.filter((x) => x.v.toLowerCase().includes(needle));
+  const numeric = /단가|수량|금액/.test(col);
+  const num = (s) => Number(String(s).replace(/,/g, '')) || 0;
+  values.sort((a, b) => (a.v === '' ? -1 : b.v === '' ? 1 : numeric ? num(a.v) - num(b.v) : a.v.localeCompare(b.v, 'ko')));
+  res.json({ values: values.slice(0, VALUES_MAX), total: values.length, truncated: values.length > VALUES_MAX });
 });
 
 // 탭 라벨에 쓰는 필터별 전체 건수(기간 필터 없이, 지역 조건은 반영) — 표와 별개로 가볍게 조회.
@@ -547,42 +617,36 @@ app.get('/api/hub-items/counts', (req, res) => {
   res.json({ total: count(myFiltersWhere(req.user.id, null)), byFilter });
 });
 
-// 화면에 보이는 목록(같은 탭·기간·정렬·컬럼 순서)을 페이지 구분 없이 전부 엑셀로.
-// 조건은 /api/hub-items와 똑같이 만들어서 화면과 파일 내용이 어긋나지 않게 한다.
+// 화면에 보이는 목록(같은 탭·기간·컬럼 값 필터·정렬·컬럼 순서)을 페이지 구분 없이 전부 엑셀로.
+// /api/hub-items와 같은 조회 함수를 써서 화면과 파일 내용이 어긋나지 않게 한다.
+// 값 필터를 많이 고르면 URL이 길어지므로 화면은 POST로 부르고, GET도 그대로 받는다.
 const EXPORT_MAX_ROWS = 50000;
-app.get('/api/hub-items/export', (req, res) => {
-  const filterId = Number(req.query.filter) || null;
-  const from = (req.query.from || '').trim();
-  const to = (req.query.to || '').trim();
-  const cols = String(req.query.cols || '').split(',').filter((c) => SORTABLE_COLS.has(c));
+const exportHandler = (req, res) => {
+  const q = req.method === 'POST' ? req.body || {} : req.query;
+  const filterId = Number(q.filter) || null;
+  const from = String(q.from || '').trim();
+  const to = String(q.to || '').trim();
+  const colList = Array.isArray(q.cols) ? q.cols : String(q.cols || '').split(',');
+  const cols = colList.filter((c) => SORTABLE_COLS.has(c));
   const header = cols.length ? [...new Set(cols)] : [...SORTABLE_COLS];
 
-  const scope = myFiltersWhere(req.user.id, filterId);
-  let rows = [];
-  if (scope) {
-    const conds = [scope.sql], params = [...scope.params];
-    if (from) { conds.push('contract_date >= ?'); params.push(from); }
-    if (to) { conds.push('contract_date <= ?'); params.push(to); }
-    const byName = req.query.sort === '품목명';
-    const order = byName ? { sql: 'contract_date DESC, contract_no DESC, item_seq', params: [] } : orderBySql(req.query.sort, req.query.dir);
-    let list = db.prepare(`SELECT raw_json FROM hub_items WHERE ${conds.join(' AND ')} ORDER BY ${order.sql} LIMIT ?`)
-      .all(...params, ...order.params, EXPORT_MAX_ROWS)
-      .map((r) => toDisplayRow(r.raw_json)); // 화면과 같은 정리된 품목명
-    if (byName) list = sortByDisplayName(list, req.query.dir);
-    rows = list.map((j) => header.map((c) => j[c] ?? ''));
-  }
+  const { rows: list } = queryHubRows(req.user.id, q, 0, EXPORT_MAX_ROWS);
+  const rows = list.map((j) => header.map((c) => j[c] ?? ''));
 
   const f = filterId ? db.prepare(`SELECT keyword, region FROM filters WHERE id = ? AND user_id = ?`).get(filterId, req.user.id) : null;
   const label = f ? `${f.keyword}${f.region ? `_${f.region}` : ''}` : '전체';
   const period = from || to ? `${from || '처음'}-${to || '끝'}` : '전체기간';
-  const filename = `나라장터_조달내역_${label}_${period}.xlsx`.replace(/[\\/:*?"<>|,\s]+/g, '_');
+  const filtered = Object.keys(parseColFilters(q.cf)).length ? '_필터적용' : '';
+  const filename = `나라장터_조달내역_${label}_${period}${filtered}.xlsx`.replace(/[\/:*?"<>|,\s]+/g, '_');
   const buf = buildXlsx({ sheetName: label, header, rows, numeric: header.map((c) => /단가|수량|금액/.test(c)) });
   res.set({
     'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'Content-Disposition': `attachment; filename="g2b-export.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
     'Cache-Control': 'no-store',
   }).send(buf);
-});
+};
+app.get('/api/hub-items/export', exportHandler);
+app.post('/api/hub-items/export', exportHandler);
 
 // 검색엔진용 공개 페이지(/, /items, /item/:code, robots.txt, sitemap.xml) — "/"를 static보다
 // 먼저 가로채야 해서 이 위치에 둔다.
