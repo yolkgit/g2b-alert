@@ -293,8 +293,15 @@ app.get('/api/item-lookup', async (req, res) => {
 app.post('/api/filters', (req, res) => {
   const { keyword, region, itemCode } = req.body || {};
   if (!keyword || !keyword.trim()) return res.status(400).json({ error: 'keyword 필요' });
+  const kw = keyword.trim(), rg = (region || '').trim(), code = (itemCode || '').trim();
+  // 추가 버튼 한 번으로 바로 등록되므로(더블클릭·재전송) 같은 품목+지역이 이미 있으면 막는다.
+  // 품목번호가 있으면 번호+지역으로, 없으면(번호 못 찾은 필터) 이름+지역으로 같은지 본다.
+  const dup = code
+    ? db.prepare(`SELECT id FROM filters WHERE user_id = ? AND item_code = ? AND COALESCE(region, '') = ?`).get(req.user.id, code, rg)
+    : db.prepare(`SELECT id FROM filters WHERE user_id = ? AND (item_code IS NULL OR item_code = '') AND keyword = ? AND COALESCE(region, '') = ?`).get(req.user.id, kw, rg);
+  if (dup) return res.status(409).json({ error: '이미 추가된 품목·지역이에요' });
   const info = db.prepare(`INSERT INTO filters (user_id, keyword, region, item_code, created_at) VALUES (?, ?, ?, ?, ?)`)
-    .run(req.user.id, keyword.trim(), (region || '').trim() || null, (itemCode || '').trim() || null, new Date().toISOString());
+    .run(req.user.id, kw, rg || null, code || null, new Date().toISOString());
   res.json({ id: info.lastInsertRowid });
 });
 app.delete('/api/filters/:id', (req, res) => {
