@@ -479,6 +479,34 @@ function orderBySql(col, dir) {
   return { sql: `json_extract(raw_json, ?) ${d}, ${tiebreak}`, params: [path] };
 }
 
+// 품목명은 "세부품명, 제조사, 모델, 규격…" 꼴로 들어와서, 앞의 세부품명·제조사(=업체)가 표의
+// 세부품명·업체명 컬럼과 겹친다. 표시용으로는 그 겹치는 앞부분을 뺀다(원본 raw_json은 그대로).
+//  - 맨 앞이 이 행의 세부품명이면 뺀다.
+//  - 그다음 덩어리가 이 행의 업체명 컬럼과 같은 회사일 때만 뺀다("(주)"·"주식회사" 같은 표기는 무시).
+//    업체명과 다른 제조사·상표 이름은 정보라서 남긴다.
+//  - 빼고 나면 아무것도 안 남으면(품목명이 세부품명뿐) 원래 이름을 그대로 둔다.
+// 쉼표 뒷부분은 문자열을 자르기만 해서 "TW-M400,1종"처럼 값 안의 쉼표도 그대로 보존된다.
+const COMPANY_NOISE = /\([가-힣]{1,3}\)|㈜|주식회사|유한회사|합자회사|합명회사|\s+/g; // (주)·(합자)·(유) 같은 법인 표기 포함
+const normCompany = (s) => String(s || '').replace(COMPANY_NOISE, '').toLowerCase();
+function cleanItemName(row) {
+  const name = String(row['품목명'] || '').trim();
+  const detail = String(row['세부품명'] || '').trim();
+  if (!name || !detail || !name.startsWith(detail)) return name;
+  let rest = name.slice(detail.length).match(/^\s*,\s*([\s\S]*)$/);
+  if (!rest) return name;
+  rest = rest[1];
+  const comma = rest.indexOf(',');
+  const token = comma < 0 ? rest : rest.slice(0, comma);
+  const t = normCompany(token), c = normCompany(row['업체명']);
+  // 같은 회사: 이름이 같거나, 2글자 이상 줄임말이 회사명 앞부분("남일" ← "남일스페이스")이거나 3글자 이상이 포함될 때
+  if (t && c && (t === c || (t.length >= 2 && c.startsWith(t)) || (t.length >= 3 && c.includes(t)))) rest = comma < 0 ? '' : rest.slice(comma + 1).trimStart();
+  return rest || name;
+}
+const toDisplayRow = (rawJson) => { const j = JSON.parse(rawJson); j['품목명'] = cleanItemName(j); return j; };
+// 품목명 정렬은 화면에 보이는(정리된) 이름 기준이어야 해서 SQL이 아니라 여기서 한다(필터로 좁힌 행만이라 작다).
+// sort()는 안정 정렬이라 같은 이름끼리는 SQL이 준 최신 계약순이 유지된다.
+const sortByDisplayName = (rows, dir) => rows.sort((a, b) => (dir === 'asc' ? 1 : -1) * String(a['품목명']).localeCompare(String(b['품목명']), 'ko'));
+
 // 조달데이터허브에서 긁어온 라인아이템을 내 필터(품목번호+지역)로 좁혀서 본다.
 // 기간(from/to)·정렬(sort/dir)·페이지(page/pageSize)는 서버에서 처리한다(페이지를 넘겨도 정렬 유지).
 app.get('/api/hub-items', (req, res) => {
@@ -496,10 +524,17 @@ app.get('/api/hub-items', (req, res) => {
   const where = 'WHERE ' + conds.join(' AND ');
   const order = orderBySql(req.query.sort, req.query.dir);
 
+  const offset = (page - 1) * pageSize;
+  if (req.query.sort === '품목명') {
+    const all = sortByDisplayName(
+      db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY contract_date DESC, contract_no DESC, item_seq`).all(...params).map((r) => toDisplayRow(r.raw_json)),
+      req.query.dir);
+    return res.json({ rows: all.slice(offset, offset + pageSize), total: all.length, page, pageSize });
+  }
   const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${where}`).get(...params).c;
   const rows = db.prepare(`SELECT raw_json FROM hub_items ${where} ORDER BY ${order.sql} LIMIT ? OFFSET ?`)
-    .all(...params, ...order.params, pageSize, (page - 1) * pageSize);
-  res.json({ rows: rows.map((r) => JSON.parse(r.raw_json)), total, page, pageSize });
+    .all(...params, ...order.params, pageSize, offset);
+  res.json({ rows: rows.map((r) => toDisplayRow(r.raw_json)), total, page, pageSize });
 });
 
 // 탭 라벨에 쓰는 필터별 전체 건수(기간 필터 없이, 지역 조건은 반영) — 표와 별개로 가볍게 조회.
@@ -528,10 +563,13 @@ app.get('/api/hub-items/export', (req, res) => {
     const conds = [scope.sql], params = [...scope.params];
     if (from) { conds.push('contract_date >= ?'); params.push(from); }
     if (to) { conds.push('contract_date <= ?'); params.push(to); }
-    const order = orderBySql(req.query.sort, req.query.dir);
-    rows = db.prepare(`SELECT raw_json FROM hub_items WHERE ${conds.join(' AND ')} ORDER BY ${order.sql} LIMIT ?`)
+    const byName = req.query.sort === '품목명';
+    const order = byName ? { sql: 'contract_date DESC, contract_no DESC, item_seq', params: [] } : orderBySql(req.query.sort, req.query.dir);
+    let list = db.prepare(`SELECT raw_json FROM hub_items WHERE ${conds.join(' AND ')} ORDER BY ${order.sql} LIMIT ?`)
       .all(...params, ...order.params, EXPORT_MAX_ROWS)
-      .map((r) => { const j = JSON.parse(r.raw_json); return header.map((c) => j[c] ?? ''); });
+      .map((r) => toDisplayRow(r.raw_json)); // 화면과 같은 정리된 품목명
+    if (byName) list = sortByDisplayName(list, req.query.dir);
+    rows = list.map((j) => header.map((c) => j[c] ?? ''));
   }
 
   const f = filterId ? db.prepare(`SELECT keyword, region FROM filters WHERE id = ? AND user_id = ?`).get(filterId, req.user.id) : null;
