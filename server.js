@@ -9,6 +9,7 @@ const webpush = require('web-push');
 
 const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
 const { registerSeoRoutes } = require('./seo');
+const { buildXlsx } = require('./xlsx');
 
 const app = express();
 app.disable('x-powered-by');
@@ -304,6 +305,13 @@ app.post('/api/push/subscribe', (req, res) => {
     .run(req.user.id, sub.endpoint, sub.keys.p256dh, sub.keys.auth, new Date().toISOString());
   res.json({ ok: true });
 });
+// 이 기기(endpoint)가 지금 로그인한 계정으로 구독돼 있는지 — 화면이 로드될 때마다 "알림 켜짐"
+// 표시를 실제 상태로 맞추는 데 쓴다. endpoint는 푸시를 보낼 수 있는 주소라 URL이 아니라 본문으로 받는다.
+app.post('/api/push/status', (req, res) => {
+  const { endpoint } = req.body || {};
+  const row = endpoint ? db.prepare(`SELECT 1 FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`).get(endpoint, req.user.id) : null;
+  res.json({ subscribed: !!row });
+});
 app.delete('/api/push/subscribe', (req, res) => {
   const { endpoint } = req.body || {};
   db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`).run(endpoint, req.user.id);
@@ -493,6 +501,40 @@ app.get('/api/hub-items/counts', (req, res) => {
     byFilter[f.id] = count(myFiltersWhere(req.user.id, f.id));
   }
   res.json({ total: count(myFiltersWhere(req.user.id, null)), byFilter });
+});
+
+// 화면에 보이는 목록(같은 탭·기간·정렬·컬럼 순서)을 페이지 구분 없이 전부 엑셀로.
+// 조건은 /api/hub-items와 똑같이 만들어서 화면과 파일 내용이 어긋나지 않게 한다.
+const EXPORT_MAX_ROWS = 50000;
+app.get('/api/hub-items/export', (req, res) => {
+  const filterId = Number(req.query.filter) || null;
+  const from = (req.query.from || '').trim();
+  const to = (req.query.to || '').trim();
+  const cols = String(req.query.cols || '').split(',').filter((c) => SORTABLE_COLS.has(c));
+  const header = cols.length ? [...new Set(cols)] : [...SORTABLE_COLS];
+
+  const scope = myFiltersWhere(req.user.id, filterId);
+  let rows = [];
+  if (scope) {
+    const conds = [scope.sql], params = [...scope.params];
+    if (from) { conds.push('contract_date >= ?'); params.push(from); }
+    if (to) { conds.push('contract_date <= ?'); params.push(to); }
+    const order = orderBySql(req.query.sort, req.query.dir);
+    rows = db.prepare(`SELECT raw_json FROM hub_items WHERE ${conds.join(' AND ')} ORDER BY ${order.sql} LIMIT ?`)
+      .all(...params, ...order.params, EXPORT_MAX_ROWS)
+      .map((r) => { const j = JSON.parse(r.raw_json); return header.map((c) => j[c] ?? ''); });
+  }
+
+  const f = filterId ? db.prepare(`SELECT keyword, region FROM filters WHERE id = ? AND user_id = ?`).get(filterId, req.user.id) : null;
+  const label = f ? `${f.keyword}${f.region ? `_${f.region}` : ''}` : '전체';
+  const period = from || to ? `${from || '처음'}-${to || '끝'}` : '전체기간';
+  const filename = `나라장터_조달내역_${label}_${period}.xlsx`.replace(/[\\/:*?"<>|,\s]+/g, '_');
+  const buf = buildXlsx({ sheetName: label, header, rows, numeric: header.map((c) => /단가|수량|금액/.test(c)) });
+  res.set({
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="g2b-export.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Cache-Control': 'no-store',
+  }).send(buf);
 });
 
 // 검색엔진용 공개 페이지(/, /items, /item/:code, robots.txt, sitemap.xml) — "/"를 static보다
@@ -734,6 +776,14 @@ function rescheduleAllAlarms() {
   }
 }
 rescheduleAllAlarms();
+
+// 재시작 뒤에도 알림 설정이 남아 있는지 로그만 보고 알 수 있게, 부팅 때 요약을 남긴다(개수·시간만).
+{
+  const n = (sql) => db.prepare(sql).get().c;
+  const times = db.prepare(`SELECT alarm_time t, COUNT(*) c FROM users GROUP BY alarm_time ORDER BY alarm_time`).all()
+    .map((r) => `${r.t}(${r.c}명)`).join(' ') || '없음';
+  console.log(`[boot] 사용자 ${n('SELECT COUNT(*) c FROM users')}명 · 필터 ${n('SELECT COUNT(*) c FROM filters')}건 · 푸시 구독 ${n('SELECT COUNT(*) c FROM push_subscriptions')}건 · 알림 시간 ${times}`);
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));

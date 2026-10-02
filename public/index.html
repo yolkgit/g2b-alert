@@ -68,6 +68,19 @@ thead th.dragging{opacity:.35}
 thead th.drop-before{box-shadow:inset 3px 0 0 var(--primary)}
 thead th.drop-after{box-shadow:inset -3px 0 0 var(--primary)}
 body.col-dragging,body.col-dragging *{cursor:grabbing !important}
+.sheet-backdrop{position:fixed;inset:0;background:rgb(0 0 0 / .45);display:flex;align-items:flex-end;justify-content:center;z-index:50;padding:16px}
+@media (min-width:600px){.sheet-backdrop{align-items:center}}
+.sheet{background:var(--card);border-radius:calc(var(--radius) + 6px);padding:22px 20px 16px;width:100%;max-width:420px;box-shadow:0 10px 30px rgb(0 0 0 / .2);word-break:keep-all;max-height:calc(100vh - 32px);overflow-y:auto}
+.sheet h3{font-size:17px;font-weight:700;line-height:1.4;margin-bottom:10px}
+.sheet p,.sheet li{font-size:14px;line-height:1.65;color:var(--muted-foreground)}
+.sheet ol{padding-left:20px;display:grid;gap:10px;margin:4px 0 10px}
+.sheet b{color:var(--foreground)}
+.sheet .sub{margin:8px 0 0}
+.sheet-actions{display:flex;gap:8px;margin-top:16px}
+.sheet-actions>*{flex:1;text-align:center;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
+.share-ico{display:inline-block;vertical-align:-4px;margin:0 2px}
+.sheet-actions a.btn-link{background:var(--primary);color:var(--primary-foreground);border:1px solid var(--primary);border-radius:calc(var(--radius) - 2px);padding:9px 16px;font-size:13px;font-weight:500}
+.sheet-actions a.btn-link.secondary{background:var(--secondary);color:var(--secondary-foreground);border-color:var(--border)}
 .linklike{background:none;border:none;color:var(--muted-foreground);font-size:12px;padding:0;text-decoration:underline;text-underline-offset:2px;cursor:pointer;flex:none}
 thead th.sortable:hover,thead th[aria-sort]{color:var(--foreground)}
 thead th.num{text-align:right}
@@ -206,6 +219,8 @@ html.authed #main-view{display:block}
     <div class="card" id="notify-panel" style="display:none">
       <h2>알림</h2>
       <button class="secondary" onclick="enablePush()" id="push-btn">홈화면 알림 켜기</button>
+      <div class="sub" id="push-hint" style="margin:8px 0 0;display:none"></div>
+      <button class="linklike" id="install-link" style="display:none;margin-top:8px" onclick="promptInstall()">📲 홈 화면에 앱으로 추가</button>
       <div class="sub" id="hub-sub" style="margin-top:8px">아직 실행한 적 없음</div>
       <div class="row" style="margin-top:6px">
         <input type="time" id="alarm-time">
@@ -261,7 +276,10 @@ html.authed #main-view{display:block}
       </div>
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
         <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
-        <button class="linklike" id="col-reset" style="display:none" onclick="resetColOrder()">열 순서 초기화</button>
+        <div style="display:flex;gap:12px;align-items:center;flex:none">
+          <button class="linklike" id="col-reset" style="display:none" onclick="resetColOrder()">열 순서 초기화</button>
+          <button class="secondary" id="excel-btn" style="display:none;flex:none;padding:5px 12px;font-size:12px" onclick="downloadExcel()">엑셀 저장</button>
+        </div>
       </div>
       <div class="table-scroll">
         <table>
@@ -279,7 +297,42 @@ html.authed #main-view{display:block}
   </div>
 </div>
 
+<div id="sheet" class="sheet-backdrop" style="display:none" onclick="if(event.target===this)closeSheet()">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <h3 id="sheet-title"></h3>
+    <div id="sheet-body"></div>
+    <div class="sheet-actions" id="sheet-actions"></div>
+  </div>
+</div>
+
 <script>
+// 안드로이드 크롬·삼성 인터넷 등은 "홈 화면에 추가(앱 설치)" 창을 우리가 원할 때 띄울 수 있다 —
+// 브라우저가 알아서 띄우는 하단 배너는 막아 두고, 알림 켜기 직후에 물어볼 때 쓴다.
+let installPrompt = null;
+function showInstallLink(show) {
+  const el = document.getElementById('install-link');
+  if (el) el.style.display = show ? '' : 'none';
+}
+window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; showInstallLink(true); });
+window.addEventListener('appinstalled', () => { installPrompt = null; showInstallLink(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+
+// "홈 화면에 추가" 브라우저 설치 창을 띄운다(사용자 클릭 안에서만 가능). 결과를 안내 문구로 남긴다.
+async function promptInstall() {
+  const p = installPrompt;
+  if (!p) return;
+  installPrompt = null;
+  showInstallLink(false);
+  p.prompt();
+  const { outcome } = await p.userChoice;
+  const hint = document.getElementById('push-hint');
+  hint.style.display = '';
+  hint.textContent = outcome === 'accepted'
+    ? '홈 화면에 추가했어요. 이제 아이콘으로 바로 열 수 있어요.'
+    : '홈 화면 추가를 취소했어요. 다시 하려면 알림 창의 "홈 화면에 추가"를 누르세요.';
+  if (outcome !== 'accepted') { installPrompt = p; showInstallLink(true); }
+}
+
 async function api(path, opts) {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const data = await res.json().catch(() => ({}));
@@ -338,6 +391,7 @@ async function boot() {
   document.getElementById('whoami').textContent = username ? `${username}님` : '';
   initQueryDates();
   await loadSettings(); await loadFilters();
+  syncPushState(); // 기다리지 않고 — 표 로딩을 늦추지 않게
   if (pendingFilter) await applyPendingFilter();
   await loadContracts();
 }
@@ -716,6 +770,9 @@ function renderTable(data) {
 
   setHeader(colOrder);
   document.getElementById('col-reset').style.display = colOrder.join() === HUB_COLS.join() ? 'none' : '';
+  const excelBtn = document.getElementById('excel-btn');
+  excelBtn.style.display = total ? '' : 'none';
+  excelBtn.textContent = `엑셀 저장 (${total.toLocaleString()}건)`;
   empty.style.display = rows.length ? 'none' : 'block';
   if (total) {
     pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
@@ -735,6 +792,20 @@ function renderTable(data) {
   document.getElementById('pager-info').textContent = `${currentPage} / ${pageCount} 페이지`;
   document.getElementById('pager-prev').disabled = currentPage <= 1;
   document.getElementById('pager-next').disabled = currentPage >= pageCount;
+}
+
+// 지금 보이는 목록(탭·기간·정렬·컬럼 순서 그대로)을 페이지 구분 없이 전부 엑셀로 받는다.
+function downloadExcel() {
+  const params = new URLSearchParams({ sort: sortCol, dir: sortDir, cols: colOrder.join(',') });
+  if (activeFilterId !== 'all') params.set('filter', activeFilterId);
+  if (queryFrom) params.set('from', queryFrom.replace(/-/g, ''));
+  if (queryTo) params.set('to', queryTo.replace(/-/g, ''));
+  const a = document.createElement('a');
+  a.href = '/api/hub-items/export?' + params.toString();
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 function gotoPage(p) {
@@ -792,24 +863,156 @@ function urlBase64ToUint8Array(base64String) {
   return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
 
-async function enablePush() {
+// ─── 안내 창(아래에서 올라오는 시트) ───────────────────────
+// body는 이 파일 안의 고정 문구만 넣는다(사용자·외부 데이터 X).
+function openSheet({ title, html, actions }) {
+  document.getElementById('sheet-title').textContent = title;
+  document.getElementById('sheet-body').innerHTML = html;
+  const box = document.getElementById('sheet-actions');
+  box.innerHTML = '';
+  for (const a of actions) {
+    const el = document.createElement(a.href ? 'a' : 'button');
+    el.textContent = a.label;
+    if (a.href) { el.href = a.href; el.className = 'btn-link' + (a.primary ? '' : ' secondary'); }
+    else { el.className = a.primary ? '' : 'secondary'; el.onclick = a.onClick || closeSheet; }
+    box.appendChild(el);
+  }
+  document.getElementById('sheet').style.display = 'flex';
+}
+function closeSheet() { document.getElementById('sheet').style.display = 'none'; }
+
+// ─── 기기·브라우저 판별 ───────────────────────────────────
+const UA = navigator.userAgent;
+const isIOS = /iPhone|iPad|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isAndroid = /Android/i.test(UA);
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+// 카톡·네이버앱·인스타 등 앱 안 브라우저는 알림도 홈 화면 추가도 안 된다
+function inAppBrowser() {
+  if (/KAKAOTALK/i.test(UA)) return 'kakao';
+  if (/NAVER\(inapp|Instagram|FBAN|FBAV|FB_IAB|Line\/|DaumApps|everytimeApp|BAND\//i.test(UA)) return 'other';
+  return null;
+}
+// iOS 버전을 정수(16.4 → 1604)로 — 소수로 비교하면 경계(16.4)에서 부동소수점 오차가 날 수 있다
+function iosVersion() {
+  const m = UA.match(/OS (\d+)_(\d+)/);
+  return m ? Number(m[1]) * 100 + Number(m[2]) : null;
+}
+const SHARE_ICON = '<svg class="share-ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0a84ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 7 4-4 4 4"/><path d="M6 11H5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-1"/></svg>';
+
+function showOpenExternalSheet(kind) {
+  const here = location.origin + '/';
+  if (kind === 'kakao') {
+    return openSheet({
+      title: '카카오톡 안에서는 알림을 받을 수 없어요',
+      html: '<p>카카오톡 안 브라우저는 알림과 홈 화면 추가를 지원하지 않아요. 기본 브라우저(크롬·사파리)로 열어서 <b>홈화면 알림 켜기</b>를 다시 눌러주세요.</p><p class="sub">새 브라우저에서는 한 번 더 로그인해야 해요.</p>',
+      actions: [{ label: '닫기' }, { label: '기본 브라우저로 열기', primary: true, href: 'kakaotalk://web/openExternal?url=' + encodeURIComponent(here) }],
+    });
+  }
+  if (isAndroid) {
+    return openSheet({
+      title: '이 앱 안에서는 알림을 받을 수 없어요',
+      html: '<p>지금 화면은 다른 앱 안의 브라우저라서 알림과 홈 화면 추가가 안 돼요. 크롬으로 열어서 <b>홈화면 알림 켜기</b>를 다시 눌러주세요.</p><p class="sub">크롬에서는 한 번 더 로그인해야 해요.</p>',
+      actions: [{ label: '닫기' }, { label: '크롬으로 열기', primary: true, href: `intent://${location.host}/#Intent;scheme=https;package=com.android.chrome;end` }],
+    });
+  }
+  openSheet({
+    title: '이 앱 안에서는 알림을 받을 수 없어요',
+    html: '<p>지금 화면은 다른 앱 안의 브라우저예요. 화면 위나 아래의 <b>···</b> 메뉴에서 <b>Safari로 열기</b>를 누른 뒤, <b>홈화면 알림 켜기</b>를 다시 눌러주세요.</p>',
+    actions: [{ label: '확인', primary: true }],
+  });
+}
+
+function showIOSHomeScreenGuide() {
+  const v = iosVersion();
+  if (v !== null && v < 1604) {
+    return openSheet({
+      title: 'iOS 업데이트가 필요해요',
+      html: '<p>아이폰 알림은 <b>iOS 16.4 이상</b>에서 받을 수 있어요. 설정 → 일반 → 소프트웨어 업데이트에서 업데이트한 뒤 다시 시도해 주세요.</p>',
+      actions: [{ label: '확인', primary: true }],
+    });
+  }
+  openSheet({
+    title: '아이폰은 홈 화면에 추가해야 알림을 받을 수 있어요',
+    html: `<ol>
+      <li>Safari 화면 아래(아이패드는 위)의 <b>공유 버튼</b>${SHARE_ICON}을 누르세요. 안 보이면 <b>···</b> 버튼을 먼저 누르세요.</li>
+      <li>메뉴를 위로 올려 <b>홈 화면에 추가</b> → <b>추가</b>를 누르세요.</li>
+      <li>홈 화면에 생긴 <b>나라장터알림</b> 아이콘으로 열고, 🔔 알림 → <b>홈화면 알림 켜기</b>를 한 번 더 누르세요.</li>
+    </ol>
+    <p class="sub">아이폰은 애플 정책상 웹사이트가 스스로 홈 화면에 추가할 수 없어서 직접 추가해야 해요. 홈 화면 앱에서는 처음에 다시 로그인해야 할 수 있어요.</p>`,
+    actions: [{ label: '확인', primary: true }],
+  });
+}
+
+// 알림이 켜진 뒤, 브라우저가 "앱 설치" 창을 띄울 수 있으면(안드로이드) 바로 추가할지 묻는다.
+// prompt()는 사용자 클릭 안에서만 되므로 "추가" 버튼 클릭에서 부른다.
+function offerInstall() {
+  openSheet({
+    title: '홈 화면에 바로 추가할까요?',
+    html: '<p>알림이 켜졌어요. 홈 화면에 추가하면 아이콘을 눌러 앱처럼 바로 열 수 있고, 알림을 누르면 이 화면으로 바로 들어와요.</p>',
+    actions: [
+      { label: '나중에' },
+      { label: '홈 화면에 추가', primary: true, onClick: () => { closeSheet(); promptInstall(); } },
+    ],
+  });
+}
+
+// 화면을 열 때마다 알림 버튼을 실제 상태로 맞춘다. 예전엔 "켜짐"이 버튼을 누른 그 순간 메모리에만
+// 있어서, 새로고침·서버 재시작 뒤 접속하면 알림이 계속 켜져 있어도 항상 "켜기"로 돌아가 있었다.
+// 이 기기가 브라우저에 구독돼 있고 서버에도 이 계정으로 등록돼 있을 때만 "켜짐"으로 본다.
+async function syncPushState() {
   const btn = document.getElementById('push-btn');
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    alert('이 브라우저는 푸시 알림을 지원하지 않습니다. 홈 화면에 추가한 뒤 다시 시도해 보세요.');
+  const hint = document.getElementById('push-hint');
+  btn.textContent = '홈화면 알림 켜기';
+  btn.disabled = false;
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return;
+  if (Notification.permission === 'denied') {
+    hint.style.display = '';
+    hint.textContent = '이 브라우저에서 알림이 차단돼 있어요. 주소창 왼쪽 자물쇠(설정) → 알림 → 허용으로 바꿔주세요.';
     return;
   }
   try {
-    const perm = await Notification.requestPermission();
-    if (perm !== 'granted') return alert('알림 권한이 거부되었습니다.');
-    const reg = await navigator.serviceWorker.register('/sw.js');
-    const sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(window.__vapidKey),
-    });
-    await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify(sub) });
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    const sub = reg && await reg.pushManager.getSubscription();
+    if (!sub) return;
+    const { subscribed } = await api('/api/push/status', { method: 'POST', body: JSON.stringify({ endpoint: sub.endpoint }) });
+    if (subscribed) { btn.textContent = '알림 켜짐 ✔'; btn.disabled = true; }
+  } catch (e) { /* 상태 확인 실패는 조용히 — 버튼은 그대로 눌러서 켤 수 있다 */ }
+}
+
+async function subscribePush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { alert('알림 권한이 거부되었습니다. 브라우저 설정에서 이 사이트 알림을 허용해 주세요.'); return false; }
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  const sub = await reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(window.__vapidKey),
+  });
+  await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify(sub) });
+  return true;
+}
+
+// 홈화면 알림 켜기: 알림이 안 되는 환경(앱 안 브라우저, 홈 화면에 안 넣은 아이폰)이면 거기서
+// 벗어나는 방법을 안내하고, 되는 환경이면 알림을 켠 뒤 필요하면 홈 화면 추가까지 이어서 물어본다.
+async function enablePush() {
+  const btn = document.getElementById('push-btn');
+  const inApp = inAppBrowser();
+  if (inApp) return showOpenExternalSheet(inApp);
+  if (isIOS && !isStandalone()) return showIOSHomeScreenGuide();
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    alert('이 브라우저는 푸시 알림을 지원하지 않습니다. 크롬이나 사파리 최신 버전에서 열어주세요.');
+    return;
+  }
+  try {
+    if (!(await subscribePush())) return;
     btn.textContent = '알림 켜짐 ✔';
     btn.disabled = true;
-  } catch (e) { alert('알림 등록 실패: ' + e.message); }
+  } catch (e) { alert('알림 등록 실패: ' + e.message); return; }
+  if (isStandalone() || !isAndroid) return;
+  if (installPrompt) return offerInstall();
+  // 설치 창을 못 띄우는 브라우저이거나 이미 홈 화면에 있는 경우 — 직접 하는 방법만 짧게 알려준다
+  const hint = document.getElementById('push-hint');
+  hint.style.display = '';
+  hint.textContent = "홈 화면에 아이콘이 없다면: 브라우저 메뉴(⋮) → '홈 화면에 추가' 또는 '앱 설치'를 누르세요.";
 }
 
 boot();
