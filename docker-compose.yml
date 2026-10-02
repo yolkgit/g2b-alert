@@ -12,4 +12,5 @@ services:
       - DB_PATH=/app/data/data.db
       - APP_PASSWORD=${APP_PASSWORD:-g2balert2026}
       - G2B_SERVICE_KEY=${G2B_SERVICE_KEY:-}
+      - ADMIN_USERNAMES=${ADMIN_USERNAMES:-admin}
       - TZ=Asia/Seoul

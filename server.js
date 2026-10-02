@@ -239,11 +239,12 @@ app.use((req, res, next) => {
 });
 
 // ─── 설정 / 필터 ──────────────────────────────────────────
-// 서비스키처럼 앱 전체에 걸린 설정은 관리자(기본 'admin', 계정 도입 전 공유 비밀번호가 옮겨간 계정)만
-// 바꿀 수 있다. 가입이 열려 있어서 아무나 계정을 만들 수 있으므로, 일반 계정이 덮어쓰면 모든 사용자의
-// 품목 검색이 같이 망가진다.
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const isAdmin = (user) => user.username === ADMIN_USERNAME;
+// 서비스키처럼 앱 전체에 걸린 설정은 관리자만 바꿀 수 있다. 가입이 열려 있어서 아무나 계정을 만들 수
+// 있으므로, 일반 계정이 덮어쓰면 모든 사용자의 품목 검색이 같이 망가진다.
+// 관리자 아이디는 코드에 박지 않고 환경변수 ADMIN_USERNAMES(쉼표로 여러 개)로 정한다. 안 정하면
+// 계정 도입 전 공유 비밀번호가 옮겨간 'admin'.
+const ADMIN_USERNAMES = new Set((process.env.ADMIN_USERNAMES || 'admin').split(',').map((s) => s.trim()).filter(Boolean));
+const isAdmin = (user) => ADMIN_USERNAMES.has(user.username);
 
 app.get('/api/settings', (req, res) => {
   res.json({
@@ -790,7 +791,7 @@ rescheduleAllAlarms();
   const n = (sql) => db.prepare(sql).get().c;
   const times = db.prepare(`SELECT alarm_time t, COUNT(*) c FROM users GROUP BY alarm_time ORDER BY alarm_time`).all()
     .map((r) => `${r.t}(${r.c}명)`).join(' ') || '없음';
-  console.log(`[boot] 사용자 ${n('SELECT COUNT(*) c FROM users')}명 · 필터 ${n('SELECT COUNT(*) c FROM filters')}건 · 푸시 구독 ${n('SELECT COUNT(*) c FROM push_subscriptions')}건 · 알림 시간 ${times}`);
+  console.log(`[boot] 관리자 ${[...ADMIN_USERNAMES].join(',')} · 사용자 ${n('SELECT COUNT(*) c FROM users')}명 · 필터 ${n('SELECT COUNT(*) c FROM filters')}건 · 푸시 구독 ${n('SELECT COUNT(*) c FROM push_subscriptions')}건 · 알림 시간 ${times}`);
 }
 
 const PORT = process.env.PORT || 3000;
