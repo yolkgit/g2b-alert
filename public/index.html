@@ -110,7 +110,20 @@ body.col-dragging,body.col-dragging *{cursor:grabbing !important}
 .linklike{background:none;border:none;color:var(--muted-foreground);font-size:12px;padding:0;text-decoration:underline;text-underline-offset:2px;cursor:pointer;flex:none}
 thead th.sortable:hover,thead th[aria-sort]{color:var(--foreground)}
 thead th.num{text-align:right}
-.sort-ind{font-size:9px;margin-left:4px}
+.sort-ind{font-size:9px;margin-left:4px;flex:none}
+/* 컬럼 너비 조절: 머리글 오른쪽 가장자리를 끈다. 너비를 고정하려면 table-layout:fixed + colgroup이 필요해서
+   렌더할 때마다 자연 너비를 재서(저장된 너비가 있는 컬럼은 그 값으로) colgroup에 박는다. */
+thead th{position:relative;overflow:hidden;padding-right:10px}
+.th-in{display:flex;align-items:center;min-width:0;gap:2px}
+thead th.num .th-in{justify-content:flex-end}
+.th-label{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.th-in .th-menu{flex:none}
+.col-resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none;z-index:1}
+.col-resizer::after{content:'';position:absolute;right:4px;top:22%;bottom:22%;width:2px;border-radius:1px;background:var(--border)}
+.col-resizer:hover::after,.col-resizer.active::after{background:var(--foreground)}
+body.col-resizing,body.col-resizing *{cursor:col-resize !important;user-select:none;-webkit-user-select:none}
+table.fixed{table-layout:fixed}
+table.fixed tbody td{max-width:none}
 tbody td{padding:10px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 tbody tr:hover{background:var(--muted)}
 td.num{text-align:right;color:var(--foreground);font-variant-numeric:tabular-nums}
@@ -305,7 +318,7 @@ html.authed #main-view{display:block}
       <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
         <div class="sub" id="hub-note" style="margin-bottom:8px;display:none"></div>
         <div style="display:flex;gap:12px;align-items:center;flex:none">
-          <button class="linklike" id="col-reset" style="display:none" onclick="resetColOrder()">열 순서 초기화</button>
+          <button class="linklike" id="col-reset" style="display:none" onclick="resetColOrder()">열 순서·너비 초기화</button>
           <button class="secondary" id="excel-btn" style="display:none;flex:none;padding:5px 12px;font-size:12px" onclick="downloadExcel()">엑셀 저장</button>
         </div>
       </div>
@@ -675,10 +688,91 @@ let colOrder = loadColOrder();
 function saveColOrder() {
   try { localStorage.setItem(COL_ORDER_KEY, JSON.stringify(colOrder)); } catch (e) {}
 }
-function resetColOrder() {
+// 컬럼 너비(px): 이 브라우저(localStorage)에 컬럼 이름별로 저장한다. 값이 이상하거나 모르는 컬럼은 버린다.
+// 저장 안 된 컬럼은 렌더할 때마다 내용에 맞춘 자연 너비를 쓴다.
+const COL_WIDTH_KEY = 'g2b.colWidths';
+const COL_MIN_W = 56, COL_MAX_W = 800;
+function loadColWidths() {
+  const out = {};
+  try {
+    const saved = JSON.parse(localStorage.getItem(COL_WIDTH_KEY) || 'null');
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      for (const [c, w] of Object.entries(saved)) {
+        if (HUB_COLS.includes(c) && Number.isFinite(w)) out[c] = Math.min(COL_MAX_W, Math.max(COL_MIN_W, Math.round(w)));
+      }
+    }
+  } catch (e) {}
+  return out;
+}
+let colWidths = loadColWidths();
+function saveColWidths() {
+  try {
+    if (Object.keys(colWidths).length) localStorage.setItem(COL_WIDTH_KEY, JSON.stringify(colWidths));
+    else localStorage.removeItem(COL_WIDTH_KEY);
+  } catch (e) {}
+}
+function resetColOrder() { // 순서와 너비를 함께 처음 상태로
   colOrder = [...HUB_COLS];
-  try { localStorage.removeItem(COL_ORDER_KEY); } catch (e) {}
+  colWidths = {};
+  try { localStorage.removeItem(COL_ORDER_KEY); localStorage.removeItem(COL_WIDTH_KEY); } catch (e) {}
   renderTable(lastTableData);
+}
+const colSettingsChanged = () => colOrder.join() !== HUB_COLS.join() || Object.keys(colWidths).length > 0;
+
+// 렌더 직후 호출: 자연 너비를 재고(저장된 컬럼은 저장값) colgroup에 박아 table-layout:fixed로 바꾼다.
+// 이렇게 해야 사용자가 정한 너비가 내용 길이에 밀려 바뀌지 않는다. 저장 안 된 컬럼은 이 페이지 내용에 맞는 너비.
+function applyColWidths() {
+  const table = document.getElementById('contract-thead').closest('table');
+  table.classList.remove('fixed');
+  table.querySelector('colgroup')?.remove();
+  table.style.width = 'max-content';
+  const ths = [...document.querySelectorAll('#contract-thead th')];
+  const natural = ths.map((th) => Math.ceil(th.getBoundingClientRect().width));
+  const widths = ths.map((th, i) => colWidths[th.dataset.col] ?? Math.max(COL_MIN_W, natural[i]));
+  const cg = document.createElement('colgroup');
+  for (const w of widths) { const c = document.createElement('col'); c.style.width = w + 'px'; cg.appendChild(c); }
+  table.prepend(cg);
+  table.style.width = widths.reduce((a, b) => a + b, 0) + 'px';
+  table.classList.add('fixed');
+}
+
+// 머리글 오른쪽 가장자리를 끌면 그 컬럼 너비를 바꾼다(끄는 동안 바로 반영, 놓으면 저장).
+// 더블클릭하면 그 컬럼만 저장된 너비를 지우고 내용에 맞춘 너비로 되돌린다.
+function startColResize(e, col, th) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  e.preventDefault(); e.stopPropagation();
+  const table = th.closest('table');
+  const idx = [...th.parentNode.children].indexOf(th);
+  const colEl = table.querySelector('colgroup')?.children[idx];
+  if (!colEl) return;
+  const handle = e.currentTarget;
+  const startX = e.clientX, startW = th.getBoundingClientRect().width;
+  const startTotal = parseFloat(table.style.width) || table.getBoundingClientRect().width;
+  let w = startW;
+  handle.classList.add('active');
+  document.body.classList.add('col-resizing');
+  closeColMenu();
+  const move = (ev) => {
+    w = Math.min(COL_MAX_W, Math.max(COL_MIN_W, startW + ev.clientX - startX));
+    colEl.style.width = w + 'px';
+    table.style.width = (startTotal + w - startW) + 'px';
+  };
+  const end = () => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', end);
+    document.removeEventListener('pointercancel', end);
+    handle.classList.remove('active');
+    document.body.classList.remove('col-resizing');
+    suppressHeaderClick = true; // 놓은 자리에서 따라오는 click이 정렬로 처리되지 않게
+    setTimeout(() => { suppressHeaderClick = false; }, 0);
+    if (Math.abs(w - startW) < 1) return; // 그냥 눌렀다 뗀 것
+    colWidths[col] = Math.round(w);
+    saveColWidths();
+    document.getElementById('col-reset').style.display = '';
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', end);
+  document.addEventListener('pointercancel', end);
 }
 
 // 머리글을 짧게 누르면 그 컬럼으로 정렬(다시 누르면 방향 반전, 숫자·날짜는 내림차순·글자는
@@ -692,13 +786,19 @@ function setHeader(cols) {
     const th = document.createElement('th');
     th.className = 'sortable' + (isNumCol(c) ? ' num' : '');
     th.dataset.col = c;
-    th.title = '클릭: 정렬 · 끌기: 위치 이동';
-    th.textContent = c;
+    th.title = '클릭: 정렬 · 끌기: 위치 이동 · 오른쪽 끝 끌기: 너비 조절';
+    const inner = document.createElement('div');
+    inner.className = 'th-in';
+    const label = document.createElement('span');
+    label.className = 'th-label';
+    label.textContent = c;
+    inner.appendChild(label);
+    th.appendChild(inner);
     if (c === sortCol) {
       const ind = document.createElement('span');
       ind.className = 'sort-ind';
       ind.textContent = sortDir === 'asc' ? '▲' : '▼';
-      th.appendChild(ind);
+      inner.appendChild(ind);
       th.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
     }
     const mb = document.createElement('button');
@@ -708,7 +808,19 @@ function setHeader(cols) {
     mb.title = colFilters[c] ? c + ' — 필터 적용 중' : c + ' 정렬·필터';
     mb.setAttribute('aria-haspopup', 'dialog');
     mb.onclick = (e) => { e.stopPropagation(); (colMenuEl && colMenuEl.dataset.col === c) ? closeColMenu() : openColMenu(c, th); };
-    th.appendChild(mb);
+    inner.appendChild(mb);
+    const rz = document.createElement('div');
+    rz.className = 'col-resizer';
+    rz.title = '끌어서 너비 조절 · 더블클릭: 자동 너비';
+    rz.addEventListener('pointerdown', (e) => startColResize(e, c, th));
+    rz.addEventListener('click', (e) => e.stopPropagation());
+    rz.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      if (colWidths[c] == null) return;
+      delete colWidths[c]; saveColWidths();
+      renderTable(lastTableData);
+    });
+    th.appendChild(rz);
     th.onclick = () => {
       if (suppressHeaderClick) return;
       if (sortCol === c) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
@@ -991,7 +1103,7 @@ function renderTable(data) {
 
   setHeader(colOrder);
   renderColChips();
-  document.getElementById('col-reset').style.display = colOrder.join() === HUB_COLS.join() ? 'none' : '';
+  document.getElementById('col-reset').style.display = colSettingsChanged() ? '' : 'none';
   const excelBtn = document.getElementById('excel-btn');
   excelBtn.style.display = total ? '' : 'none';
   excelBtn.textContent = `엑셀 저장 (${total.toLocaleString()}건)`;
@@ -1014,6 +1126,7 @@ function renderTable(data) {
   document.getElementById('pager-info').textContent = `${currentPage} / ${pageCount} 페이지`;
   document.getElementById('pager-prev').disabled = currentPage <= 1;
   document.getElementById('pager-next').disabled = currentPage >= pageCount;
+  applyColWidths();
 }
 
 // 지금 보이는 목록(탭·기간·정렬·컬럼 순서 그대로)을 페이지 구분 없이 전부 엑셀로 받는다.
