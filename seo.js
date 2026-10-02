@@ -141,7 +141,9 @@ ${canonical ? `<meta property="og:url" content="${esc(canonical)}">\n` : ''}<met
 <meta property="og:locale" content="ko_KR">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#18181b">
-<link rel="icon" href="/icons/icon-192.png">
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <link rel="stylesheet" href="/site.css">
 ${jsonLd ? jsonLdTag(jsonLd) : ''}
 </head>

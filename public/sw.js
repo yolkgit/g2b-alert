@@ -8,7 +8,7 @@ self.addEventListener('push', (event) => {
     self.registration.showNotification(data.title || '나라장터 알림', {
       body: data.body || '',
       icon: '/icons/icon-192.png',
-      badge: '/icons/icon-192.png',
+      badge: '/icons/badge-96.png',
       data: { url: data.url || '/' },
     })
   );
