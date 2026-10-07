@@ -458,7 +458,8 @@ async function applyPendingFilter() {
 // 종료일을 오늘로 두면 허브 쪽 달력이 항상 하루 전으로 튕겨나가 조회가 실패하므로(집계가
 // 아직 안 끝난 걸로 보임) 종료일 선택 상한을 어제로 막고, 기본값도 최근 30일로 채워준다.
 function initQueryDates() {
-  const toDate = (d) => d.toISOString().slice(0, 10);
+  // 이 기기의 날짜 기준(YYYY-MM-DD). toISOString()은 UTC라서 한국에서 0~9시에는 하루 전 날짜가 나온다.
+  const toDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   const yesterday = toDate(new Date(Date.now() - 86400000));
   const monthAgo = toDate(new Date(Date.now() - 30 * 86400000));
   const fromEl = document.getElementById('query-from'), toEl = document.getElementById('query-to');
@@ -524,14 +525,18 @@ async function changePassword() {
   } catch (e) { err.textContent = e.message; }
 }
 
-// 진행 바는 hub-scrape든 hub-query든 어느 쪽이 돌든 공유한다(동시에 하나만 돌 수 있어서).
+// 수집은 서버에서 한 번에 하나씩 차례로 돌아서(대기열), 내 조회가 다른 사람 것 뒤에 설 수 있다 — 그때는 대기 중이라고 알린다.
 // %가 안 움직이면 멈춘 걸로 착각하기 쉬워서, 스크래퍼 내부 1~5단계 로그를 서버가 실시간으로
 // 읽어 percent로 환산해준 걸 그대로 바 너비에 반영한다.
 function updateHubProgress(st) {
   const box = document.getElementById('hub-progress');
   const text = document.getElementById('hub-progress-text');
   const bar = document.getElementById('hub-progress-bar');
-  if (st.status === 'running') {
+  if (st.status === 'queued') {
+    box.style.display = 'block';
+    text.textContent = st.ahead > 1 ? `다른 조회 ${st.ahead}건이 끝나기를 기다리는 중이에요...` : '다른 조회가 끝나기를 기다리는 중이에요...';
+    bar.style.width = '0%';
+  } else if (st.status === 'running') {
     box.style.display = 'block';
     text.textContent = `${st.progress || '진행 중...'} (${st.percent ?? 0}%)`;
     bar.style.width = `${st.percent ?? 0}%`;
@@ -1196,22 +1201,40 @@ async function runQuery() {
       await loadTablePage();
       return;
     }
-    btn.textContent = '조회 중...';
-    const poll = setInterval(async () => {
-      const st = await api('/api/hub-scrape/status');
-      updateHubProgress(st);
-      if (st.status === 'done' || st.status === 'error') {
-        clearInterval(poll);
-        btn.disabled = false; btn.textContent = '조회';
-        if (st.error) err.textContent = st.error;
-        await loadTabCounts(); renderContractTabs();
-        await loadTablePage();
-      }
-    }, 2000);
+    if (result.alreadyRunning) err.textContent = '이미 진행 중인 조회가 있어요. 끝나면 결과를 보여드릴게요.';
+    btn.textContent = '대기 중...';
+    followJob(result.jobId, btn, err);
   } catch (e) {
     err.textContent = e.message;
     btn.disabled = false; btn.textContent = '조회';
   }
+}
+
+// 조회 작업이 끝날 때까지 2초마다 진행 상황을 확인한다. 서버가 잠시 응답하지 못해도(재시작 등) 몇 번은 다시 시도하고,
+// 계속 안 되면 버튼을 풀어 준다(예전에는 한 번 실패하면 "조회 중..."이 영원히 남았다).
+let jobPoll = null;
+function followJob(jobId, btn, err) {
+  clearInterval(jobPoll);
+  let fails = 0, busy = false;
+  const stop = () => { clearInterval(jobPoll); jobPoll = null; btn.disabled = false; btn.textContent = '조회'; updateHubProgress({ status: 'idle' }); };
+  jobPoll = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const st = await api(`/api/hub-scrape/status?job=${encodeURIComponent(jobId)}`);
+      fails = 0;
+      updateHubProgress(st);
+      btn.textContent = st.status === 'queued' ? '대기 중...' : '조회 중...';
+      if (st.status === 'done' || st.status === 'error') {
+        stop();
+        if (st.error) err.textContent = st.error;
+        await loadTabCounts(); renderContractTabs();
+        await loadTablePage();
+      }
+    } catch (e) {
+      if (++fails >= 5) { stop(); err.textContent = '진행 상황을 확인하지 못했어요. 잠시 뒤 새로고침해서 확인해 주세요.'; }
+    } finally { busy = false; }
+  }, 2000);
 }
 
 function urlBase64ToUint8Array(base64String) {

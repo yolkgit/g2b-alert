@@ -3,8 +3,12 @@ services:
     build: .
     container_name: g2b-alert
     restart: unless-stopped
+    # 수집이 띄우는 크로미움 같은 자식 프로세스가 끝난 뒤 좀비로 남지 않게 init 프로세스(tini)를 둔다
+    init: true
     ports:
-      - "3008:3000"
+      # 127.0.0.1에만 연다 — nginx(HTTPS)를 거쳐서만 접속된다. 예전처럼 0.0.0.0이면 인터넷에서 3008로 직접 들어와
+      # HTTPS·요청 제한(접속자 IP 기준)을 우회할 수 있다.
+      - "127.0.0.1:3008:3000"
     volumes:
       - ./data:/app/data
     environment:
@@ -13,4 +17,6 @@ services:
       - APP_PASSWORD=${APP_PASSWORD:-g2balert2026}
       - G2B_SERVICE_KEY=${G2B_SERVICE_KEY:-}
       - ADMIN_USERNAMES=${ADMIN_USERNAMES:-admin}
+      # 요청 제한을 한꺼번에 늘리거나 줄이는 배수(기본 1). 한 사무실·학교처럼 한 IP에서 여럿이 쓰면 2~3으로.
+      - RATE_LIMIT_MULTIPLIER=${RATE_LIMIT_MULTIPLIER:-1}
       - TZ=Asia/Seoul
