@@ -9,13 +9,28 @@ const webpush = require('web-push');
 
 const { searchItemCodes, summarizeItem } = require('./itemLookupClient');
 const { registerSeoRoutes } = require('./seo');
-const { buildXlsx } = require('./xlsx');
+const { Worker } = require('worker_threads');
+const compression = require('compression');
+const hubq = require('./hubquery');
 
 const app = express();
 app.disable('x-powered-by');
+// nginx 한 단계 뒤에서 돈다 → X-Forwarded-For의 마지막 값(nginx가 붙인 실제 접속자 IP)을 req.ip로 쓴다.
+// 요청 제한이 IP별로 동작하려면 필수다(안 하면 모두 같은 IP로 보여 한 명이 막히면 전원이 막힌다).
+app.set('trust proxy', 1);
+// JSON 응답·HTML을 압축한다(목록 한 페이지 약 30KB → 약 5KB, 폰·느린 망에서 체감이 크다). nginx는 HTML만 압축한다.
+app.use(compression());
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db');
 const db = new Database(DB_PATH);
 db.pragma('foreign_keys = ON');
+// WAL: 읽는 쪽과 쓰는 쪽이 서로 막지 않는다. 수집 스크립트(별도 프로세스)가 hub_items에 쓰는 동안에도, 엑셀 전용
+// 스레드가 따로 읽는 동안에도 일반 요청이 멈추지 않는다(예전 방식은 쓰는 동안 읽기가 최대 5초 대기했다).
+// synchronous=NORMAL은 WAL에서 안전하다(정전 시 마지막 몇 건만 잃을 수 있고 파일은 깨지지 않는다).
+const journalMode = db.pragma('journal_mode = WAL', { simple: true });
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -32768'); // 페이지 캐시 32MB
+db.pragma('temp_store = MEMORY');
+if (journalMode !== 'wal') console.warn(`[db] WAL을 켜지 못했습니다(journal_mode=${journalMode}) — 동시 접속 성능이 떨어집니다`);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -96,6 +111,16 @@ try { db.exec(`ALTER TABLE push_subscriptions ADD COLUMN user_id INTEGER REFEREN
   }
 }
 
+// 조회용 가벼운 색인 표(hub_idx)와 트리거를 보장한다 — 자세한 이유는 hubquery.js 맨 위 설명 참고
+{
+  const t0 = Date.now();
+  const r = hubq.ensureHubIndex(db);
+  if (r.added || r.orphan) console.log(`[db] 조회용 색인 표 정리: 추가 ${r.added}행, 제거 ${r.orphan}행 (${Date.now() - t0}ms)`);
+  // 정리된 품목명(JS가 필요한 열)은 부팅을 막지 않도록 조금씩 나눠 채운다. 그 사이 품목명 정렬·필터 요청은 남은 만큼 즉시 채운다.
+  const step = () => { try { if (hubq.fillNames(db, 3000)) setImmediate(step); } catch (e) { console.error('[db] 품목명 채우기 실패:', e.message); } };
+  setImmediate(step);
+}
+
 function getSetting(key, fallback = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
   return row ? row.value : fallback;
@@ -106,17 +131,26 @@ function setSetting(key, value) {
 }
 
 // ─── 비밀번호 해싱 (내장 crypto만 사용, 새 의존성 없음) ──────────
-function hashPassword(pw) {
+// scrypt는 일부러 느린 함수(약 60~100ms, 메모리도 씀)라서 동기 버전을 쓰면 그동안 서버 전체가 멈춘다 — 로그인·가입이
+// 몰리면 다른 사용자의 모든 요청이 줄줄이 늦어진다. 비동기 버전은 별도 스레드풀에서 돌아 서버가 계속 일한다.
+const scryptAsync = (pw, salt) => new Promise((resolve, reject) => crypto.scrypt(pw, salt, 64, (err, key) => (err ? reject(err) : resolve(key))));
+async function hashPassword(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return `scrypt:${salt}:${(await scryptAsync(pw, salt)).toString('hex')}`;
+}
+function hashPasswordSync(pw) { // 부팅 때 한 번 도는 옛 비밀번호 이전용(요청 처리 중엔 쓰지 않는다)
   const salt = crypto.randomBytes(16).toString('hex');
   return `scrypt:${salt}:${crypto.scryptSync(pw, salt, 64).toString('hex')}`;
 }
-function verifyPassword(pw, stored) {
+async function verifyPassword(pw, stored) {
   const [scheme, salt, hashHex] = (stored || '').split(':');
   if (scheme !== 'scrypt' || !salt || !hashHex) return false;
-  const candidate = crypto.scryptSync(pw, salt, 64);
+  const candidate = await scryptAsync(pw, salt);
   const expected = Buffer.from(hashHex, 'hex');
   return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
 }
+// 없는 아이디도 같은 시간이 걸리게 하려고 쓰는 가짜 해시(응답 시간으로 가입 여부를 알아내지 못하게)
+const DUMMY_HASH = hashPasswordSync(crypto.randomBytes(8).toString('hex'));
 
 // ─── 세션 (쿠키 값 = 랜덤 토큰, sessions 테이블에서 조회) ────────
 function createSession(userId) {
@@ -153,7 +187,7 @@ function destroySession(req) {
   if (userCount === 0 && legacyPassword && (filterCount > 0 || subCount > 0)) {
     const legacyAlarmTime = getSetting('alarm_time', '07:00');
     const info = db.prepare(`INSERT INTO users (username, password_hash, alarm_time, created_at) VALUES (?, ?, ?, ?)`)
-      .run('admin', hashPassword(legacyPassword), legacyAlarmTime, new Date().toISOString());
+      .run('admin', hashPasswordSync(legacyPassword), legacyAlarmTime, new Date().toISOString());
     db.prepare(`UPDATE filters SET user_id = ? WHERE user_id IS NULL`).run(info.lastInsertRowid);
     db.prepare(`UPDATE push_subscriptions SET user_id = ? WHERE user_id IS NULL`).run(info.lastInsertRowid);
     console.log(`[migrate] admin 계정 생성, 필터 ${filterCount}건·구독 ${subCount}건 이전, alarm_time=${legacyAlarmTime}`);
@@ -178,7 +212,8 @@ webpush.setVapidDetails(
   getSetting('vapid_private')
 );
 
-app.use(express.json({ limit: '2mb' }));
+app.use('/api/hub-items', express.json({ limit: '1mb' })); // 값 필터를 많이 고른 표 요청은 클 수 있다
+app.use(express.json({ limit: '64kb' }));
 
 // ─── 계정 인증 (아이디+비밀번호, 세션 쿠키) ──────────────────
 function parseCookies(req) {
@@ -186,38 +221,80 @@ function parseCookies(req) {
   h.split(';').forEach((p) => { const i = p.indexOf('='); if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); });
   return out;
 }
-function setSessionCookie(res, token) {
-  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(token)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`);
+// https(nginx가 X-Forwarded-Proto로 알려줌)로 들어온 요청이면 Secure를 붙여 http로는 쿠키가 나가지 않게 한다
+const cookieTail = (req) => `Path=/; HttpOnly; SameSite=Lax${req.secure ? '; Secure' : ''}`;
+function setSessionCookie(req, res, token) {
+  res.setHeader('Set-Cookie', `app_auth=${encodeURIComponent(token)}; Max-Age=31536000; ${cookieTail(req)}`);
 }
 
-app.post('/api/login', (req, res) => {
+// ─── 요청 제한(메모리, 의존성 없음) ───────────────────────────
+// 한 사람(또는 봇)이 서버를 독차지하지 못하게 창(windowMs) 안에서 max번까지만 받고 넘으면 429로 기다리게 한다.
+// 키는 IP(로그인 전) 또는 사용자 id(로그인 후). 서버를 재시작하면 초기화된다.
+// RATE_LIMIT_MULTIPLIER(환경변수, 기본 1)로 모든 제한을 한꺼번에 늘리거나 줄일 수 있다(예: 사무실 한 곳에서 다 같이 쓸 때 2~3배).
+const RATE_LIMIT_MULTIPLIER = Number(process.env.RATE_LIMIT_MULTIPLIER) > 0 ? Number(process.env.RATE_LIMIT_MULTIPLIER) : 1;
+function makeLimiter({ windowMs, max: baseMax, key, message }) {
+  const max = Math.max(1, Math.round(baseMax * RATE_LIMIT_MULTIPLIER));
+  const hits = new Map();
+  setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (v.reset <= now) hits.delete(k); }, 60 * 1000).unref();
+  return (req, res, next) => {
+    const now = Date.now();
+    const k = key(req);
+    let e = hits.get(k);
+    if (!e || e.reset <= now) {
+      if (hits.size > 50000) hits.clear(); // 서로 다른 IP가 수만 개 몰려도 메모리가 무한히 늘지 않게
+      e = { n: 0, reset: now + windowMs };
+      hits.set(k, e);
+    }
+    if (++e.n > max) {
+      const secs = Math.max(1, Math.ceil((e.reset - now) / 1000));
+      res.set('Retry-After', String(secs));
+      return res.status(429).json({ error: `${message} ${secs >= 90 ? Math.ceil(secs / 60) + '분' : secs + '초'} 뒤에 다시 시도해 주세요.` });
+    }
+    next();
+  };
+}
+const byIp = (req) => `ip:${req.ip}`;
+const byUser = (req) => (req.user ? `u:${req.user.id}` : byIp(req));
+const loginLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 30, key: byIp, message: '로그인 시도가 너무 많아요.' });
+const registerLimiter = makeLimiter({ windowMs: 60 * 60 * 1000, max: 10, key: byIp, message: '가입 요청이 너무 많아요.' });
+const generalLimiter = makeLimiter({ windowMs: 60 * 1000, max: 400, key: byUser, message: '요청이 너무 많아요.' });
+const exportLimiter = makeLimiter({ windowMs: 60 * 1000, max: 8, key: byUser, message: '엑셀 저장을 너무 자주 눌렀어요.' });
+const queryLimiter = makeLimiter({ windowMs: 60 * 1000, max: 10, key: byUser, message: '조회 요청이 너무 많아요.' });
+const lookupLimiter = makeLimiter({ windowMs: 60 * 1000, max: 30, key: byUser, message: '품목 검색이 너무 잦아요.' });
+const passwordLimiter = makeLimiter({ windowMs: 10 * 60 * 1000, max: 10, key: byUser, message: '비밀번호 변경 시도가 너무 많아요.' });
+
+app.post('/api/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
-  const user = db.prepare(`SELECT * FROM users WHERE username = ?`).get((username || '').trim());
-  if (!user || !verifyPassword(password || '', user.password_hash)) {
-    return res.status(401).json({ error: '아이디 또는 비밀번호가 틀렸습니다' });
-  }
-  setSessionCookie(res, createSession(user.id));
+  const pw = typeof password === 'string' ? password.slice(0, 200) : '';
+  const user = db.prepare(`SELECT * FROM users WHERE username = ?`).get(String(username || '').trim());
+  const ok = await verifyPassword(pw, user ? user.password_hash : DUMMY_HASH); // 없는 아이디도 같은 시간을 들인다
+  if (!user || !ok) return res.status(401).json({ error: '아이디 또는 비밀번호가 틀렸습니다' });
+  setSessionCookie(req, res, createSession(user.id));
   res.json({ ok: true, username: user.username });
 });
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', registerLimiter, async (req, res) => {
   const { username, password } = req.body || {};
-  const uname = (username || '').trim();
+  const uname = String(username || '').trim();
   if (!uname || uname.length < 3) return res.status(400).json({ error: '아이디는 3자 이상이어야 합니다' });
   if (!/^[a-zA-Z0-9_-]+$/.test(uname)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 만 가능합니다' });
-  if (!password || password.length < 4) return res.status(400).json({ error: '비밀번호는 4자 이상이어야 합니다' });
+  if (uname.length > 40) return res.status(400).json({ error: '아이디는 40자 이하여야 합니다' });
+  if (typeof password !== 'string' || password.length < 4) return res.status(400).json({ error: '비밀번호는 4자 이상이어야 합니다' });
+  if (password.length > 200) return res.status(400).json({ error: '비밀번호는 200자 이하여야 합니다' });
   if (db.prepare(`SELECT id FROM users WHERE username = ?`).get(uname)) {
     return res.status(409).json({ error: '이미 사용 중인 아이디입니다' });
   }
+  const hash = await hashPassword(password); // 해시하는 동안 같은 아이디로 동시에 가입이 들어올 수 있어 저장 직전에 다시 확인한다
+  if (db.prepare(`SELECT id FROM users WHERE username = ?`).get(uname)) return res.status(409).json({ error: '이미 사용 중인 아이디입니다' });
   const info = db.prepare(`INSERT INTO users (username, password_hash, alarm_time, created_at) VALUES (?, ?, ?, ?)`)
-    .run(uname, hashPassword(password), '07:00', new Date().toISOString());
-  setSessionCookie(res, createSession(info.lastInsertRowid));
+    .run(uname, hash, '07:00', new Date().toISOString());
+  setSessionCookie(req, res, createSession(info.lastInsertRowid));
   res.json({ ok: true, username: uname });
 });
 
 app.post('/api/logout', (req, res) => {
   destroySession(req);
-  res.setHeader('Set-Cookie', `app_auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
+  res.setHeader('Set-Cookie', `app_auth=; Max-Age=0; ${cookieTail(req)}`);
   res.json({ ok: true });
 });
 
@@ -237,6 +314,11 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use('/api/', generalLimiter);
+app.use('/api/hub-items/export', exportLimiter);
+app.use('/api/hub-query', queryLimiter);
+app.use('/api/item-lookup', lookupLimiter);
+app.use('/api/settings/password', passwordLimiter);
 
 // ─── 설정 / 필터 ──────────────────────────────────────────
 // 서비스키처럼 앱 전체에 걸린 설정은 관리자만 바꿀 수 있다. 가입이 열려 있어서 아무나 계정을 만들 수
@@ -264,12 +346,13 @@ app.post('/api/settings/service-key', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/settings/password', (req, res) => {
+app.post('/api/settings/password', async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !newPassword) return res.status(400).json({ error: '현재 비밀번호와 새 비밀번호를 모두 입력하세요' });
-  if (!verifyPassword(currentPassword, req.user.password_hash)) return res.status(401).json({ error: '현재 비밀번호가 틀렸습니다' });
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) return res.status(400).json({ error: '현재 비밀번호와 새 비밀번호를 모두 입력하세요' });
+  if (!(await verifyPassword(currentPassword.slice(0, 200), req.user.password_hash))) return res.status(401).json({ error: '현재 비밀번호가 틀렸습니다' });
   if (newPassword.length < 4) return res.status(400).json({ error: '새 비밀번호는 4자 이상이어야 합니다' });
-  db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashPassword(newPassword), req.user.id);
+  if (newPassword.length > 200) return res.status(400).json({ error: '새 비밀번호는 200자 이하여야 합니다' });
+  db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(await hashPassword(newPassword), req.user.id);
   res.json({ ok: true });
 });
 
@@ -277,14 +360,30 @@ app.get('/api/filters', (req, res) => {
   res.json(db.prepare(`SELECT * FROM filters WHERE user_id = ? ORDER BY id DESC`).all(req.user.id));
 });
 
+// 모든 사용자가 같은 data.go.kr 서비스키를 나눠 쓰므로(하루 호출 한도가 있다) 같은 검색어는 다시 부르지 않는다.
+const lookupCache = new Map();
+const lookupInflight = new Map();
+const LOOKUP_TTL_MS = 60 * 60 * 1000, LOOKUP_MAX = 500;
 app.get('/api/item-lookup', async (req, res) => {
-  const keyword = (req.query.keyword || '').trim();
+  const keyword = String(req.query.keyword || '').trim().slice(0, 50);
   if (!keyword) return res.status(400).json({ error: '검색어가 필요합니다' });
   const serviceKey = getSetting('g2b_service_key');
   if (!serviceKey) return res.status(400).json({ error: '서비스키가 설정되지 않았습니다' });
+  const ck = keyword.toLowerCase();
+  const hit = lookupCache.get(ck);
+  if (hit && Date.now() - hit.at < LOOKUP_TTL_MS) return res.json({ items: hit.items });
   try {
-    const { items } = await searchItemCodes(serviceKey, keyword);
-    res.json({ items: items.map(summarizeItem) });
+    let p = lookupInflight.get(ck);
+    if (!p) {
+      p = searchItemCodes(serviceKey, keyword)
+        .then(({ items }) => items.map((it) => { const m = summarizeItem(it); return { name: m.name, code: m.code, desc: m.desc }; }))
+        .finally(() => lookupInflight.delete(ck));
+      lookupInflight.set(ck, p);
+    }
+    const items = await p;
+    if (lookupCache.size >= LOOKUP_MAX) lookupCache.delete(lookupCache.keys().next().value);
+    lookupCache.set(ck, { at: Date.now(), items });
+    res.json({ items });
   } catch (err) {
     const hint = err.message.includes('SERVICE_KEY_IS_NOT_REGISTERED') ? ' (data.go.kr에서 "조달청_물품목록정보서비스" 활용신청이 별도로 필요합니다)' : '';
     res.status(500).json({ error: err.message + hint });
@@ -334,23 +433,6 @@ app.delete('/api/push/subscribe', (req, res) => {
   res.json({ ok: true });
 });
 
-async function sendPushToUser(userId, payload) {
-  const subs = db.prepare(`SELECT * FROM push_subscriptions WHERE user_id = ?`).all(userId);
-  const body = JSON.stringify(payload);
-  for (const sub of subs) {
-    try {
-      await webpush.sendNotification(
-        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-        body
-      );
-    } catch (err) {
-      if (err.statusCode === 404 || err.statusCode === 410) {
-        db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`).run(sub.endpoint);
-      }
-    }
-  }
-}
-
 function fmtDate(d) {
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
@@ -397,268 +479,92 @@ function mergeCoverage(itemCode, newFrom, newTo) {
   for (const iv of merged) ins.run(itemCode, iv.from_date, iv.to_date);
 }
 
-// ─── 필터의 지역 조건 ─────────────────────────────────────
-// 지역은 수요기관 소재지("경기도 수원시 권선구", "충청남도 천안시")에 대해 맞춘다. 원본은
-// 정식 명칭이라 "충남"·"서울시"·"강원도" 같은 흔한 입력은 그대로는 안 걸려서 시도 약칭을 풀어준다.
-const SIDO_ALIASES = {};
-for (const [names, forms] of [
-  [['서울', '서울시', '서울특별시'], ['서울특별시']],
-  [['부산', '부산시', '부산광역시'], ['부산광역시']],
-  [['대구', '대구시', '대구광역시'], ['대구광역시']],
-  [['인천', '인천시', '인천광역시'], ['인천광역시']],
-  [['광주광역시'], ['광주광역시']], // "광주"만 쓰면 경기도 광주시도 걸리게 그대로 둔다
-  [['대전', '대전시', '대전광역시'], ['대전광역시']],
-  [['울산', '울산시', '울산광역시'], ['울산광역시']],
-  [['세종', '세종시', '세종특별자치시'], ['세종특별자치시']],
-  [['경기', '경기도'], ['경기도']],
-  [['강원', '강원도', '강원특별자치도'], ['강원특별자치도', '강원도']],
-  [['충북', '충청북도'], ['충청북도']],
-  [['충남', '충청남도'], ['충청남도']],
-  [['전북', '전라북도', '전북특별자치도'], ['전북특별자치도', '전라북도']],
-  [['전남', '전라남도'], ['전라남도']],
-  [['경북', '경상북도'], ['경상북도']],
-  [['경남', '경상남도'], ['경상남도']],
-  [['제주', '제주도', '제주특별자치도'], ['제주특별자치도', '제주도']],
-]) for (const n of names) SIDO_ALIASES[n] = forms;
-
-// "서울, 경기 수원" → [[["서울특별시"]], [["경기도"], ["수원"]]]
-// 쉼표로 나눈 묶음끼리는 OR, 묶음 안의 띄어쓴 단어들은 AND("경기 수원" = 경기도 수원시).
-// 단, 묶음이 시도 이름만으로 돼 있으면("서울 경기") 한 곳이 두 시도일 순 없으니 OR로 본다.
-// 단어 하나는 표기 후보들(전북특별자치도/전라북도 등) 중 아무거나 맞으면 된다.
-function parseRegion(region) {
-  const groups = [];
-  for (const term of String(region || '').split(/[,，/]+/)) {
-    const tokens = term.trim().split(/\s+/).filter(Boolean);
-    if (!tokens.length) continue;
-    const forms = tokens.map((t) => SIDO_ALIASES[t] || [t]);
-    if (tokens.length > 1 && tokens.every((t) => SIDO_ALIASES[t])) forms.forEach((f) => groups.push([f]));
-    else groups.push(forms);
-  }
-  return groups;
-}
-
-const LOCATION_SQL = `json_extract(raw_json, '$."수요기관소재시군구"')`;
-function regionSql(region) {
-  const groups = parseRegion(region);
-  if (!groups.length) return null;
-  const params = [];
-  const like = (s) => { params.push(`%${s.replace(/[\\%_]/g, '\\$&')}%`); return `${LOCATION_SQL} LIKE ? ESCAPE '\\'`; };
-  const sql = groups.map((g) => `(${g.map((forms) => `(${forms.map(like).join(' OR ')})`).join(' AND ')})`).join(' OR ');
-  return { sql: `(${sql})`, params };
-}
-function regionMatcher(region) {
-  const groups = parseRegion(region);
-  if (!groups.length) return () => true;
-  return (row) => {
-    const loc = String(row['수요기관소재시군구'] || '');
-    return groups.some((g) => g.every((forms) => forms.some((f) => loc.includes(f))));
-  };
-}
-
-// 내 필터(세부품명번호 + 선택적 지역)를 hub_items WHERE 조건으로. filterId를 주면 그 필터
-// 하나만, 안 주면("전체" 탭) 내 필터 전부의 합집합. 걸 게 없으면 null.
-function myFiltersWhere(userId, filterId) {
-  const filters = filterId
-    ? db.prepare(`SELECT item_code, region FROM filters WHERE user_id = ? AND id = ? AND item_code IS NOT NULL`).all(userId, filterId)
-    : db.prepare(`SELECT item_code, region FROM filters WHERE user_id = ? AND item_code IS NOT NULL`).all(userId);
-  if (!filters.length) return null;
-  const params = [];
-  const parts = filters.map((f) => {
-    params.push(f.item_code);
-    const r = regionSql(f.region);
-    if (!r) return '(item_code = ?)';
-    params.push(...r.params);
-    return `(item_code = ? AND ${r.sql})`;
-  });
-  return { sql: `(${parts.join(' OR ')})`, params };
-}
-
-// 표 머리글 정렬: 화면의 컬럼명만 허용(그대로 SQL에 넣지 않고 JSON 경로는 바인딩으로 넘긴다).
-// 단가·수량·금액은 "255,400" 같은 문자열이라 쉼표를 빼고 숫자로 비교한다.
-const SORTABLE_COLS = new Set(['조달방식', '업무구분', '계약구분', '계약(납품요구)일자', '수요기관', '수요기관소재시군구',
-  '세부품명번호', '세부품명', '품목명', '업체명', '낙찰방법', '단위', '계약납품단가', '계약납품수량', '공급금액']);
-function orderBySql(col, dir) {
-  const d = dir === 'asc' ? 'ASC' : 'DESC';
-  const tiebreak = 'contract_date DESC, contract_no DESC, item_seq';
-  if (!SORTABLE_COLS.has(col) || col === '계약(납품요구)일자') return { sql: `contract_date ${d}, contract_no ${d}, item_seq`, params: [] };
-  const path = `$."${col}"`;
-  if (/단가|수량|금액/.test(col)) return { sql: `CAST(REPLACE(json_extract(raw_json, ?), ',', '') AS REAL) ${d}, ${tiebreak}`, params: [path] };
-  return { sql: `json_extract(raw_json, ?) ${d}, ${tiebreak}`, params: [path] };
-}
-
-// 품목명은 "세부품명, 제조사, 모델, 규격…" 꼴로 들어와서, 앞의 세부품명·제조사(=업체)가 표의
-// 세부품명·업체명 컬럼과 겹친다. 표시용으로는 그 겹치는 앞부분을 뺀다(원본 raw_json은 그대로).
-//  - 맨 앞이 이 행의 세부품명이면 뺀다.
-//  - 그다음 덩어리가 이 행의 업체명 컬럼과 같은 회사일 때만 뺀다("(주)"·"주식회사" 같은 표기는 무시).
-//    업체명과 다른 제조사·상표 이름은 정보라서 남긴다.
-//  - 빼고 나면 아무것도 안 남으면(품목명이 세부품명뿐) 원래 이름을 그대로 둔다.
-// 쉼표 뒷부분은 문자열을 자르기만 해서 "TW-M400,1종"처럼 값 안의 쉼표도 그대로 보존된다.
-const COMPANY_NOISE = /\([가-힣]{1,3}\)|㈜|주식회사|유한회사|합자회사|합명회사|\s+/g; // (주)·(합자)·(유) 같은 법인 표기 포함
-const normCompany = (s) => String(s || '').replace(COMPANY_NOISE, '').toLowerCase();
-function cleanItemName(row) {
-  const name = String(row['품목명'] || '').trim();
-  const detail = String(row['세부품명'] || '').trim();
-  if (!name || !detail || !name.startsWith(detail)) return name;
-  let rest = name.slice(detail.length).match(/^\s*,\s*([\s\S]*)$/);
-  if (!rest) return name;
-  rest = rest[1];
-  const comma = rest.indexOf(',');
-  const token = comma < 0 ? rest : rest.slice(0, comma);
-  const t = normCompany(token), c = normCompany(row['업체명']);
-  // 같은 회사: 이름이 같거나, 2글자 이상 줄임말이 회사명 앞부분("남일" ← "남일스페이스")이거나 3글자 이상이 포함될 때
-  if (t && c && (t === c || (t.length >= 2 && c.startsWith(t)) || (t.length >= 3 && c.includes(t)))) rest = comma < 0 ? '' : rest.slice(comma + 1).trimStart();
-  return rest || name;
-}
-const toDisplayRow = (rawJson) => { const j = JSON.parse(rawJson); j['품목명'] = cleanItemName(j); return j; };
-// 품목명 정렬은 화면에 보이는(정리된) 이름 기준이어야 해서 SQL이 아니라 여기서 한다(필터로 좁힌 행만이라 작다).
-// sort()는 안정 정렬이라 같은 이름끼리는 SQL이 준 최신 계약순이 유지된다.
-const sortByDisplayName = (rows, dir) => rows.sort((a, b) => (dir === 'asc' ? 1 : -1) * String(a['품목명']).localeCompare(String(b['품목명']), 'ko'));
-
-// ─── 표 머리글 값 필터(엑셀의 열 필터처럼) ────────────────────
-// cf = { 컬럼명: [허용할 값…] } — 화면 컬럼명 화이트리스트만 받고 값은 문자열로. 컬럼당 최대 1000개.
-// 빈 배열은 "아무것도 선택 안 함"이라 아무 행도 안 맞는 걸로 본다. 빈 값은 ''로 통일(없는 키 = 빈 문자열).
-// GET은 cf를 JSON 문자열로, POST는 객체로 받는다(값을 많이 고르면 URL이 너무 길어져서 POST를 쓴다).
-function parseColFilters(cf) {
-  if (typeof cf === 'string') { try { cf = JSON.parse(cf); } catch (e) { return {}; } }
-  const out = {};
-  if (!cf || typeof cf !== 'object' || Array.isArray(cf)) return out;
-  for (const [col, vals] of Object.entries(cf)) {
-    if (!SORTABLE_COLS.has(col) || !Array.isArray(vals)) continue;
-    out[col] = [...new Set(vals.slice(0, 1000).map((v) => String(v ?? '')))];
-  }
-  return out;
-}
-const colExpr = `COALESCE(json_extract(raw_json, ?), '')`;
-
-// 내 필터(탭) + 기간 + 컬럼 값 필터를 WHERE로. skipCol은 그 컬럼 자신의 필터는 빼고(값 목록용 —
-// 그래야 이미 고른 값도 목록에 남아 다시 바꿀 수 있다). 품목명은 화면에 보이는(정리된) 이름 기준이라
-// SQL로 못 걸러서 nameSet으로 돌려주고 호출한 쪽이 JS에서 거른다. 탭에 걸 필터가 없으면 null.
-function buildHubQuery(userId, q, skipCol) {
-  const scope = myFiltersWhere(userId, Number(q.filter) || null);
-  if (!scope) return null;
-  const conds = [scope.sql], params = [...scope.params];
-  const from = String(q.from || '').trim(), to = String(q.to || '').trim();
-  if (from) { conds.push('contract_date >= ?'); params.push(from); }
-  if (to) { conds.push('contract_date <= ?'); params.push(to); }
-  let nameSet = null;
-  for (const [col, vals] of Object.entries(parseColFilters(q.cf))) {
-    if (col === skipCol) continue;
-    if (col === '품목명') { nameSet = new Set(vals); continue; }
-    if (!vals.length) { conds.push('0'); continue; }
-    conds.push(`${colExpr} IN (${vals.map(() => '?').join(',')})`);
-    params.push(`$."${col}"`, ...vals);
-  }
-  return { where: 'WHERE ' + conds.join(' AND '), params, nameSet };
-}
-
-// 화면 목록·엑셀이 같이 쓰는 조회. 정렬은 SQL로 하고, 품목명으로 정렬하거나 거를 때만(화면에 보이는
-// 이름이 SQL에 없어서) 행을 모두 읽어 JS에서 처리한다. 반환 rows는 offset부터 limit개의 표시용 행.
-function queryHubRows(userId, q, offset, limit) {
-  const bq = buildHubQuery(userId, q);
-  if (!bq) return { rows: [], total: 0 };
-  const byName = q.sort === '품목명';
-  if (byName || bq.nameSet) {
-    const order = byName ? { sql: 'contract_date DESC, contract_no DESC, item_seq', params: [] } : orderBySql(q.sort, q.dir);
-    let all = db.prepare(`SELECT raw_json FROM hub_items ${bq.where} ORDER BY ${order.sql}`).all(...bq.params, ...order.params)
-      .map((r) => toDisplayRow(r.raw_json));
-    if (bq.nameSet) all = all.filter((r) => bq.nameSet.has(r['품목명']));
-    if (byName) sortByDisplayName(all, q.dir);
-    return { rows: all.slice(offset, offset + limit), total: all.length };
-  }
-  const order = orderBySql(q.sort, q.dir);
-  const total = db.prepare(`SELECT COUNT(*) c FROM hub_items ${bq.where}`).get(...bq.params).c;
-  const rows = db.prepare(`SELECT raw_json FROM hub_items ${bq.where} ORDER BY ${order.sql} LIMIT ? OFFSET ?`)
-    .all(...bq.params, ...order.params, limit, offset).map((r) => toDisplayRow(r.raw_json));
-  return { rows, total };
-}
-
-// 조달데이터허브에서 긁어온 라인아이템을 내 필터(품목번호+지역)로 좁혀서 본다.
-// 기간(from/to)·컬럼 값 필터(cf)·정렬(sort/dir)·페이지(page/pageSize)는 서버에서 처리한다(페이지를 넘겨도 유지).
+// ─── 조달 내역 표(목록·값 목록·건수·엑셀) ─────────────────────
+// 조회 로직은 hubquery.js(가벼운 색인 표 hub_idx 기반). 기간(from/to)·컬럼 값 필터(cf)·정렬(sort/dir)·페이지는 모두
+// 서버가 전체 기준으로 처리해서 페이지를 넘겨도 유지된다. 값을 많이 고르면 GET 주소가 길어져서 화면은 POST로 부른다(GET도 받음).
 const hubItemsHandler = (req, res) => {
   const q = req.method === 'POST' ? req.body || {} : req.query;
   const page = Math.max(1, Number(q.page) || 1);
   const pageSize = Math.min(Math.max(1, Number(q.pageSize) || 20), 200);
-  const { rows, total } = queryHubRows(req.user.id, q, (page - 1) * pageSize, pageSize);
+  const { rows, total } = hubq.listRows(db, req.user.id, q, (page - 1) * pageSize, pageSize);
   res.json({ rows, total, page, pageSize });
 };
 app.get('/api/hub-items', hubItemsHandler);
 app.post('/api/hub-items', hubItemsHandler);
 
-// 머리글 메뉴의 체크박스 목록: 지금 보고 있는 범위(탭·기간·다른 컬럼의 필터)에서 그 컬럼에 실제로 있는
-// 값과 건수. 자기 컬럼 필터는 빼고 센다. q는 값 검색어, 너무 많으면(1000개 초과) truncated로 알린다.
-const VALUES_MAX = 1000;
+// 머리글 ▾ 메뉴의 체크박스 목록: 지금 범위(탭·기간·다른 컬럼 필터)에서 그 컬럼에 실제로 있는 값과 건수.
 app.post('/api/hub-items/values', (req, res) => {
   const q = req.body || {};
-  const col = String(q.col || '');
-  if (!SORTABLE_COLS.has(col)) return res.status(400).json({ error: '알 수 없는 컬럼' });
-  const bq = buildHubQuery(req.user.id, q, col);
-  if (!bq) return res.json({ values: [], total: 0, truncated: false });
-
-  let counts;
-  if (col === '품목명') {
-    counts = new Map();
-    for (const r of db.prepare(`SELECT raw_json FROM hub_items ${bq.where}`).all(...bq.params)) {
-      const v = toDisplayRow(r.raw_json)['품목명'];
-      counts.set(v, (counts.get(v) || 0) + 1);
-    }
-  } else {
-    counts = new Map(db.prepare(`SELECT ${colExpr} v, COUNT(*) n FROM hub_items ${bq.where} GROUP BY v`)
-      .all(`$."${col}"`, ...bq.params).map((r) => [r.v, r.n]));
-  }
-  let values = [...counts].map(([v, n]) => ({ v, n }));
-  const needle = String(q.q || '').trim().toLowerCase();
-  if (needle) values = values.filter((x) => x.v.toLowerCase().includes(needle));
-  const numeric = /단가|수량|금액/.test(col);
-  const num = (s) => Number(String(s).replace(/,/g, '')) || 0;
-  values.sort((a, b) => (a.v === '' ? -1 : b.v === '' ? 1 : numeric ? num(a.v) - num(b.v) : a.v.localeCompare(b.v, 'ko')));
-  res.json({ values: values.slice(0, VALUES_MAX), total: values.length, truncated: values.length > VALUES_MAX });
+  const r = hubq.distinctValues(db, req.user.id, q, String(q.col || ''), q.q);
+  if (!r) return res.status(400).json({ error: '알 수 없는 컬럼' });
+  res.json(r);
 });
 
-// 탭 라벨에 쓰는 필터별 전체 건수(기간 필터 없이, 지역 조건은 반영) — 표와 별개로 가볍게 조회.
-app.get('/api/hub-items/counts', (req, res) => {
-  const count = (scope) => (scope ? db.prepare(`SELECT COUNT(*) c FROM hub_items WHERE ${scope.sql}`).get(...scope.params).c : 0);
-  const byFilter = {};
-  for (const f of db.prepare(`SELECT id FROM filters WHERE user_id = ?`).all(req.user.id)) {
-    byFilter[f.id] = count(myFiltersWhere(req.user.id, f.id));
-  }
-  res.json({ total: count(myFiltersWhere(req.user.id, null)), byFilter });
-});
+// 탭 라벨에 쓰는 필터별 전체 건수(기간 필터 없이, 지역 조건은 반영). 결과는 hubquery 안에서 잠깐 기억한다.
+app.get('/api/hub-items/counts', (req, res) => res.json(hubq.countsFor(db, req.user.id)));
 
 // 화면에 보이는 목록(같은 탭·기간·컬럼 값 필터·정렬·컬럼 순서)을 페이지 구분 없이 전부 엑셀로.
-// /api/hub-items와 같은 조회 함수를 써서 화면과 파일 내용이 어긋나지 않게 한다.
-// 값 필터를 많이 고르면 URL이 길어지므로 화면은 POST로 부르고, GET도 그대로 받는다.
-const EXPORT_MAX_ROWS = 50000;
-const exportHandler = (req, res) => {
+// 수만 행을 읽고 압축하는 일은 CPU를 오래 써서 서버 본체를 멈추므로 전용 스레드(exportWorker.js)에서 만든다.
+// 동시에 2개까지 돌리고 더 오면 짧게 줄을 세우며(최대 4개), 그보다 많으면 잠시 후 다시 하라고 알린다.
+const EXPORT_MAX_ROWS = 50000, EXPORT_PARALLEL = 2, EXPORT_QUEUE_MAX = 4, EXPORT_TIMEOUT_MS = 60 * 1000;
+let exportsRunning = 0;
+const exportWaiters = [];
+async function withExportSlot(fn) {
+  if (exportsRunning >= EXPORT_PARALLEL) {
+    if (exportWaiters.length >= EXPORT_QUEUE_MAX) { const e = new Error('지금 엑셀 저장 요청이 많아요. 잠시 뒤에 다시 눌러 주세요.'); e.status = 503; throw e; }
+    await new Promise((resolve) => exportWaiters.push(resolve));
+  }
+  exportsRunning++;
+  try { return await fn(); } finally { exportsRunning--; const next = exportWaiters.shift(); if (next) next(); }
+}
+function runExportWorker(payload) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(path.join(__dirname, 'exportWorker.js'), { workerData: payload });
+    let settled = false;
+    const finish = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
+    const timer = setTimeout(() => { w.terminate(); finish(reject, new Error('엑셀 만들기 시간이 너무 오래 걸려 중단했어요')); }, EXPORT_TIMEOUT_MS);
+    w.once('message', (m) => (m.ok ? finish(resolve, m) : finish(reject, new Error(m.error))));
+    w.once('error', (e) => finish(reject, e));
+    w.once('exit', (code) => finish(reject, new Error(`엑셀 작업이 비정상 종료했어요(${code})`)));
+  });
+}
+const exportHandler = async (req, res) => {
   const q = req.method === 'POST' ? req.body || {} : req.query;
   const filterId = Number(q.filter) || null;
   const from = String(q.from || '').trim();
   const to = String(q.to || '').trim();
   const colList = Array.isArray(q.cols) ? q.cols : String(q.cols || '').split(',');
-  const cols = colList.filter((c) => SORTABLE_COLS.has(c));
-  const header = cols.length ? [...new Set(cols)] : [...SORTABLE_COLS];
-
-  const { rows: list } = queryHubRows(req.user.id, q, 0, EXPORT_MAX_ROWS);
-  const rows = list.map((j) => header.map((c) => j[c] ?? ''));
+  const cols = colList.filter((c) => hubq.SORTABLE_COLS.has(c));
+  const header = cols.length ? [...new Set(cols)] : [...hubq.SORTABLE_COLS];
 
   const f = filterId ? db.prepare(`SELECT keyword, region FROM filters WHERE id = ? AND user_id = ?`).get(filterId, req.user.id) : null;
   const label = f ? `${f.keyword}${f.region ? `_${f.region}` : ''}` : '전체';
   const period = from || to ? `${from || '처음'}-${to || '끝'}` : '전체기간';
-  const filtered = Object.keys(parseColFilters(q.cf)).length ? '_필터적용' : '';
-  const filename = `나라장터_조달내역_${label}_${period}${filtered}.xlsx`.replace(/[\/:*?"<>|,\s]+/g, '_');
-  const buf = buildXlsx({ sheetName: label, header, rows, numeric: header.map((c) => /단가|수량|금액/.test(c)) });
+  const filtered = Object.keys(hubq.parseColFilters(q.cf)).length ? '_필터적용' : '';
+  const filename = `나라장터_조달내역_${label}_${period}${filtered}.xlsx`.replace(/[\\/:*?"<>|,\s]+/g, '_');
+
+  hubq.ensureNames(db, q); // 전용 스레드는 읽기 전용이라 비어 있는 품목명은 여기서 미리 채운다
+  const out = await withExportSlot(() => runExportWorker({
+    dbPath: DB_PATH, userId: req.user.id, header, label, max: EXPORT_MAX_ROWS,
+    q: { filter: q.filter, from: q.from, to: q.to, cf: q.cf, sort: q.sort, dir: q.dir },
+  }));
   res.set({
     'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'Content-Disposition': `attachment; filename="g2b-export.xlsx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
     'Cache-Control': 'no-store',
-  }).send(buf);
+  }).send(Buffer.from(out.buf));
 };
-app.get('/api/hub-items/export', exportHandler);
-app.post('/api/hub-items/export', exportHandler);
+app.get('/api/hub-items/export', (req, res) => exportHandler(req, res).catch((e) => res.status(e.status || 500).json({ error: e.message })));
+app.post('/api/hub-items/export', (req, res) => exportHandler(req, res).catch((e) => res.status(e.status || 500).json({ error: e.message })));
 
 // 검색엔진용 공개 페이지(/, /items, /item/:code, robots.txt, sitemap.xml) — "/"를 static보다
 // 먼저 가로채야 해서 이 위치에 둔다.
 registerSeoRoutes(app, { db, getSessionUser });
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res, filePath) => {
+    if (/[\\/]icons[\\/]|og-image\.png$|favicon\.(ico|svg)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=86400');
+  },
+}));
 
 app.post('/api/settings/alarm-time', (req, res) => {
   const { time } = req.body || {};
@@ -671,7 +577,10 @@ app.post('/api/settings/alarm-time', (req, res) => {
 // ─── 조달데이터허브 수집(단가·수량·단위) ──────────────────────
 // 헤드리스 브라우저를 띄우는 무거운 작업이라 서버 프로세스와 분리해 자식 프로세스로 돌린다.
 // 브라우저가 죽더라도 앱 본체는 영향받지 않는다.
-let hubState = { status: 'idle', progress: '', percent: 0, error: null };
+const SCRAPE_SCRIPT = process.env.SCRAPE_SCRIPT || path.join(__dirname, 'scripts', 'scrape-hub.js');
+// 수집 하나(품목 하나)가 이 시간을 넘기면 멈춘 걸로 보고 강제로 끝낸다. 이게 없으면 허브 사이트가 응답하지 않을 때
+// 브라우저가 영원히 매달려서 그 뒤의 모든 수집(과 알림)이 서버를 재시작할 때까지 막힌다.
+const HUB_SCRAPE_TIMEOUT_MS = Number(process.env.HUB_SCRAPE_TIMEOUT_MS) || 8 * 60 * 1000;
 
 // scrape-hub.js는 "1. 보고서 팝업 열기...", "2. 조회물품을...", ..., "5. 수집 완료..." 처럼
 // 단계마다 번호를 찍는다. 그 줄을 실시간으로 잡아서(자식 프로세스가 끝나야만 아는 게 아니라)
@@ -683,17 +592,42 @@ function stepPercent(index, total, step) {
   const slice = (1 / total) * (step ? (step - 1) / HUB_STEP_COUNT : 0);
   return Math.min(99, Math.round((base + slice) * 100));
 }
+
+// 한국 날짜(KST) 기준 YYYYMMDD. 서버 시계는 UTC라서 toISOString()으로 날짜를 만들면 한국 새벽~아침 9시 사이에는
+// 하루 전 날짜가 나온다(아침 7시 알림이 "어제"를 그저께로 계산하던 버그의 원인).
+const kstYmd = (offsetDays = 0) => new Date(Date.now() + 9 * 3600 * 1000 + offsetDays * 86400 * 1000).toISOString().slice(0, 10).replace(/-/g, '');
+
+let currentChild = null;
+// 자식(과 그가 띄운 크로미움)을 통째로 끝낸다. 리눅스에서는 프로세스 그룹으로 보내야 크로미움이 고아로 안 남는다.
+function killTree(child, signal) {
+  if (!child || child.exitCode !== null) return;
+  try {
+    if (process.platform !== 'win32') process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (e) { try { child.kill(signal); } catch (e2) { /* 이미 끝났음 */ } }
+}
+function killScrapeChild() { killTree(currentChild, 'SIGKILL'); }
+
 function runHubScrape(code, fromDate, toDate, onStep) {
   return new Promise((resolve) => {
     const newRowsFile = path.join(path.dirname(DB_PATH), `hub-new-${code}-${process.pid}.json`);
-    const args = [path.join(__dirname, 'scripts', 'scrape-hub.js'), code];
+    const args = [SCRAPE_SCRIPT, code];
     if (fromDate && toDate) args.push(fromDate, toDate);
     const child = spawn(process.execPath, args, {
       cwd: __dirname,
       env: { ...process.env, HUB_SHOTS: '0', NEW_ROWS_FILE: newRowsFile }, // 서버에선 스크린샷 생략
+      detached: process.platform !== 'win32', // 새 프로세스 그룹 — killTree가 크로미움까지 정리할 수 있게
     });
+    currentChild = child;
     let tail = '';
     let lineBuf = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      console.error(`[hub] ${code} 수집이 ${Math.round(HUB_SCRAPE_TIMEOUT_MS / 1000)}초를 넘겨 강제 종료합니다`);
+      killTree(child, 'SIGTERM');
+      setTimeout(() => killTree(child, 'SIGKILL'), 5000).unref();
+    }, HUB_SCRAPE_TIMEOUT_MS);
     const keep = (buf) => {
       const s = buf.toString();
       tail = (tail + s).slice(-2000);
@@ -709,7 +643,14 @@ function runHubScrape(code, fromDate, toDate, onStep) {
     };
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
+    child.on('error', (e) => { // 실행 파일을 못 띄운 경우(예전에는 아무 처리가 없어 영원히 끝나지 않았다)
+      clearTimeout(timer);
+      if (currentChild === child) currentChild = null;
+      resolve({ exitCode: -1, count: null, newRows: [], tail: `프로세스 실행 실패: ${e.message}`, timedOut: false });
+    });
     child.on('close', (exitCode) => {
+      clearTimeout(timer);
+      if (currentChild === child) currentChild = null;
       const m = tail.match(/중복 제거 후 (\d+)건/);
       let newRows = [];
       try {
@@ -718,7 +659,7 @@ function runHubScrape(code, fromDate, toDate, onStep) {
           fs.unlinkSync(newRowsFile);
         }
       } catch (e) { console.error('[hub] 신규 항목 파일 읽기 실패:', e.message); }
-      resolve({ exitCode, count: m ? Number(m[1]) : null, newRows, tail });
+      resolve({ exitCode: timedOut ? 124 : (exitCode ?? -1), count: m ? Number(m[1]) : null, newRows, tail, timedOut });
     });
   });
 }
@@ -747,109 +688,240 @@ async function fillMissingItemCodes() {
 }
 
 // 종료일을 오늘로 주면 조달데이터허브 달력에서 항상 하루 전으로 튕겨나가 조회 자체가 실패한다
-// (오늘치는 아직 집계가 안 끝나 선택이 안 되는 걸로 보임, 실측 확인함) — 그래서 어제까지로 잡는다.
+// (오늘치는 아직 집계가 안 끝나 선택이 안 되는 걸로 보임, 실측 확인함) — 그래서 한국 날짜 기준 어제까지로 잡는다.
 function defaultScrapeWindow() {
-  const end = new Date(Date.now() - 86400000);
-  const begin = new Date(end.getTime() - 6 * 86400000);
-  return { fromDate: fmtDate(begin), toDate: fmtDate(end) };
+  const toDate = kstYmd(-1);
+  return { fromDate: addDaysYmd(toDate, -6), toDate };
 }
 
-// hub_items에 처음 들어간(=진짜 신규) 행이라도, 계약일자가 오래된 과거 건이면(예: 과거 날짜를
-// 수동 조회하다 우연히 처음 긁힌 경우) "신규 계약" 알림 대상에서 뺀다 — 매일 알림은 "당일 새로
-// 올라온 것"을 알리는 용도이지, DB에 언제 들어왔는지는 사용자와 상관없는 내부 사정이라서.
-const NOTIFY_RECENT_DAYS = 3;
-function isRecentEnoughToNotify(row) {
-  const d = row['계약(납품요구)일자'];
-  if (!d || !/^\d{8}$/.test(d)) return false;
-  const cutoff = fmtDate(new Date(Date.now() - NOTIFY_RECENT_DAYS * 86400000));
-  return d >= cutoff;
-}
+// ─── 알림 ─────────────────────────────────────────────────────────
+// 알림 규칙: "처음 발견된 신규 계약"을 알린다. 허브 자료는 계약일보다 며칠 늦게(보통 2~8일, 연휴에는 더) 올라오기 때문에
+// "계약일이 최근 3일 이내인 것만"이라는 예전 규칙은 거의 모든 신규 건을 걸러내서 알림이 안 갔다(어제 49건 → 0건).
+//  - 자동 수집(크론): 수집 기간(최근 7일)에 처음 나타난 행은 전부 신규다 → 모두 알린다.
+//  - 수동 "조회": 사용자가 아주 옛날 기간을 골라 처음 긁어 오는 경우가 있어서(과거 자료 채우기), 계약일이 10일 이내인
+//    행만 알린다. 그보다 오래된 행은 말없이 DB에 들어간다.
+// 신규는 hub_items의 기본키로 한 번만 감지되므로, 그 순간 알리지 않으면 그 품목을 보는 다른 사용자는 영영 못 받는다 —
+// 그래서 수집을 누가 시켰든 그 품목을 보는 모든 사용자에게 보낸다.
+const MANUAL_NOTIFY_DAYS = 10;
+const isFreshForManual = (row) => /^\d{8}$/.test(row['계약(납품요구)일자'] || '') && row['계약(납품요구)일자'] >= kstYmd(-MANUAL_NOTIFY_DAYS);
 
-// item_code 하나를 긁어서, 이번에 새로 발견된(hub_items PK 기준) 행 중 최근 것만 그 품목을
-// 보는 모든 사용자에게 알린다 — 트리거(크론이든 수동 조회든)와 무관하게 항상 같은 규칙 적용.
-// hub_items는 PK로 중복 제거되므로 "신규"는 딱 한 번만 감지된다 — 그 순간 알림을 안 보내면
-// 그 품목을 보는 다른 사용자는 영영 못 받으므로, 트리거한 사람만이 아니라 전원에게 보낸다.
-async function notifyAllUsersForCode(itemCode, rows) {
-  const recent = rows.filter(isRecentEnoughToNotify);
-  if (!recent.length) return;
-  // 같은 사용자가 같은 품목에 지역만 다르게 필터를 여러 개 걸 수 있다 — 그중 하나라도
-  // 맞는 행만 모아서, 사용자당 알림은 한 번만 보낸다(지역이 안 맞으면 안 보냄).
-  const byUser = new Map();
-  for (const f of db.prepare(`SELECT * FROM filters WHERE item_code = ?`).all(itemCode)) {
-    const e = byUser.get(f.user_id) || { filter: f, matchers: [] };
-    e.matchers.push(regionMatcher(f.region));
-    byUser.set(f.user_id, e);
+// 푸시 한 사용자(그 사용자의 모든 기기)에게 보낸다. 결과를 로그로 남긴다 — 예전에는 404/410 말고는 실패해도
+// 아무 기록이 없어서 알림이 안 갔을 때 원인을 알 수 없었다(주소·키는 기록하지 않는다).
+async function sendPushToUser(userId, payload) {
+  const subs = db.prepare(`SELECT * FROM push_subscriptions WHERE user_id = ?`).all(userId);
+  const body = JSON.stringify(payload);
+  const out = { subs: subs.length, sent: 0, failed: 0, removed: 0 };
+  for (const sub of subs) {
+    try {
+      // TTL: 기기가 꺼져 있어도 하루 안에는 전달한다(그 뒤에는 오래된 소식이라 버린다)
+      await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, body, { TTL: 86400 });
+      out.sent++;
+    } catch (err) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`).run(sub.endpoint);
+        out.removed++;
+      } else {
+        out.failed++;
+        let host = '?';
+        try { host = new URL(sub.endpoint).host; } catch (e) { /* 주소 형식 오류 */ }
+        console.error(`[push] user#${userId} 발송 실패 status=${err.statusCode || '-'} 서비스=${host} ${String(err.body || err.message).slice(0, 160)}`);
+      }
+    }
   }
-  for (const [userId, { filter: f, matchers }] of byUser) {
-    const matched = recent.filter((r) => matchers.some((m) => m(r)));
-    if (!matched.length) continue;
-    const top = matched.slice(0, 3)
-      .map((r) => `${r['품목명'] || itemCode} / ${r['수요기관'] || '기관 미확인'} / ${r['계약납품단가'] ? r['계약납품단가'] + '원' : ''}`)
-      .join('\n');
-    await sendPushToUser(userId, {
-      title: `나라장터 신규 계약 ${matched.length}건 - ${f.keyword}${matchers.length === 1 && f.region ? ` · ${f.region}` : ''}`,
-      body: top,
-      url: '/',
-    });
+  console.log(`[push] user#${userId} 구독 ${out.subs}건 → 성공 ${out.sent} 실패 ${out.failed} 만료삭제 ${out.removed}`);
+  return out;
+}
+
+// 한 작업(수집 한 번)에서 새로 발견된 행을 모아 두었다가, 사용자마다 알림 한 번으로 묶어 보낸다
+// (품목이 여러 개여도 아침에 푸시가 줄줄이 오지 않게).
+class NotifyBatch {
+  constructor(mode) { this.mode = mode; this.byCode = new Map(); }
+  add(code, rows) { if (rows && rows.length) this.byCode.set(code, (this.byCode.get(code) || []).concat(rows)); }
+  async flush() {
+    const perUser = new Map(); // userId → Map(code → { keyword, rows })
+    let newTotal = 0;
+    for (const [code, all] of this.byCode) {
+      const rows = this.mode === 'cron' ? all : all.filter(isFreshForManual);
+      newTotal += all.length;
+      if (!rows.length) continue;
+      const filtersByUser = new Map();
+      for (const f of db.prepare(`SELECT user_id, keyword, region FROM filters WHERE item_code = ?`).all(code)) {
+        const l = filtersByUser.get(f.user_id) || [];
+        l.push({ keyword: f.keyword, region: f.region, match: hubq.regionMatcher(f.region) });
+        filtersByUser.set(f.user_id, l);
+      }
+      for (const [userId, list] of filtersByUser) {
+        for (const r of rows) {
+          const hit = list.find((x) => x.match(r)); // 지역이 하나라도 맞는 필터가 있으면 그 사용자의 신규 건
+          if (!hit) continue;
+          const groups = perUser.get(userId) || new Map();
+          const g = groups.get(code) || { keyword: hit.keyword, rows: [] };
+          g.rows.push(r);
+          groups.set(code, g);
+          perUser.set(userId, groups);
+        }
+      }
+    }
+    const targets = [...perUser];
+    // 사용자가 많아도 느린 푸시 서비스 한 곳에 줄줄이 막히지 않게 5명씩 동시에 보낸다
+    for (let i = 0; i < targets.length; i += 5) {
+      await Promise.all(targets.slice(i, i + 5).map(([userId, groups]) => sendPushToUser(userId, buildPushPayload(groups))));
+    }
+    return { newTotal, users: targets.length };
+  }
+}
+function buildPushPayload(groups) {
+  const list = [...groups.values()].sort((a, b) => b.rows.length - a.rows.length);
+  const total = list.reduce((s, g) => s + g.rows.length, 0);
+  const lines = list.slice(0, 3).map((g) => {
+    const latest = g.rows.reduce((m, r) => ((r['계약(납품요구)일자'] || '') > (m['계약(납품요구)일자'] || '') ? r : m), g.rows[0]);
+    const price = latest['계약납품단가'] ? ` / ${latest['계약납품단가']}원` : '';
+    return `${g.keyword} ${g.rows.length}건 · ${hubq.cleanItemName(latest) || g.keyword} / ${latest['수요기관'] || '기관 미확인'}${price}`;
+  });
+  if (list.length > 3) lines.push(`외 ${list.length - 3}개 품목`);
+  return { title: `나라장터 신규 계약 ${total}건`, body: lines.join('\n'), url: '/' };
+}
+
+// ─── 수집 작업 대기열 ────────────────────────────────────────────
+// 크로미움을 띄우는 수집은 메모리를 많이 쓰고(다른 앱과 같이 쓰는 서버다) 한 번에 하나만 돌려야 한다. 예전에는 하나가
+// 돌고 있으면 다른 사용자의 "조회"는 "이미 실행 중"으로 거절했고, 예약 시각이 겹친 자동 수집은 말없이 건너뛰었다 —
+// 사용자가 늘수록 알림이 조용히 빠진다. 이제 모든 수집을 한 줄로 세워 차례대로 돌린다.
+//  - 자동 수집(cron)은 수동 조회보다 앞에 세운다(사람의 조회 줄에 밀려 알림이 늦어지지 않게).
+//  - 같은 일을 이미 기다리거나 돌고 있으면 새로 만들지 않고 그 작업을 돌려준다(연타·같은 시각 중복 방지).
+//  - 수동 조회는 사용자당 하나만(한 사람이 줄을 독차지하지 못하게), 전체 대기는 최대 30개.
+const JOB_QUEUE_MAX = 30;
+const jobs = new Map(); // id → job (끝난 것도 10분은 남겨서 화면이 결과를 읽어 간다)
+const jobQueue = [];    // 대기 중 job id (앞이 먼저)
+let currentJob = null;
+let jobSeq = 0;
+
+function enqueueJob({ kind, key, userId = null, run }) {
+  for (const j of jobs.values()) if ((j.state === 'queued' || j.state === 'running') && j.key === key) return { job: j, dup: true };
+  if (jobQueue.length >= JOB_QUEUE_MAX) { const e = new Error('지금 수집 요청이 많아요. 잠시 뒤에 다시 시도해 주세요.'); e.status = 503; throw e; }
+  const job = { id: ++jobSeq, kind, key, userId, state: 'queued', progress: '대기 중', percent: 0, error: null, createdAt: Date.now(), run };
+  jobs.set(job.id, job);
+  const at = kind === 'cron' ? jobQueue.findIndex((id) => jobs.get(id).kind !== 'cron') : -1;
+  if (at >= 0) jobQueue.splice(at, 0, job.id); else jobQueue.push(job.id);
+  setImmediate(pumpJobs);
+  return { job, dup: false };
+}
+async function pumpJobs() {
+  if (currentJob) return;
+  const id = jobQueue.shift();
+  if (id === undefined) return;
+  const job = jobs.get(id);
+  if (!job) return pumpJobs();
+  currentJob = job;
+  job.state = 'running'; job.startedAt = Date.now(); job.progress = '시작하는 중...';
+  console.log(`[job #${job.id} ${job.key}] 시작 (대기 ${Math.round((job.startedAt - job.createdAt) / 1000)}초, 남은 대기 ${jobQueue.length}건)`);
+  try {
+    await job.run(job);
+    job.state = 'done'; job.percent = 100;
+  } catch (e) {
+    job.state = 'error'; job.error = e.message;
+    console.error(`[job #${job.id} ${job.key}] 실패:`, e.stack || e.message);
+  } finally {
+    job.finishedAt = Date.now();
+    console.log(`[job #${job.id} ${job.key}] ${job.state} (${Math.round((job.finishedAt - job.startedAt) / 1000)}초)`);
+    currentJob = null;
+    setTimeout(() => jobs.delete(job.id), 10 * 60 * 1000).unref();
+    pumpJobs();
+  }
+}
+// 화면이 보는 모양. status: queued(대기) / running / done / error
+const jobView = (job) => ({
+  id: job.id, status: job.state, progress: job.progress, percent: job.percent, error: job.error,
+  ahead: job.state === 'queued' ? jobQueue.indexOf(job.id) + (currentJob ? 1 : 0) : 0, // 내 앞에서 기다리는 작업 수(돌고 있는 것 포함)
+});
+
+// 새로 들어온 행의 정리된 품목명을 채운다(트리거는 JS를 못 부른다). 한꺼번에 많아도 서버가 멈추지 않게 나눠서 한다.
+async function fillNewNames() {
+  while (hubq.hasPendingNames(db)) {
+    hubq.fillNames(db, 2000);
+    await new Promise((r) => setImmediate(r));
   }
 }
 
-// item_code 목록을 하나씩(중복 없이) 긁는다 — 여러 사용자가 같은 품목을 봐도 한 번만 스크래핑.
-async function scrapeCodesAndNotify(codes, { fromDate, toDate }) {
+// 품목들을 하나씩(중복 없이) 긁는다 — 여러 사용자가 같은 품목을 봐도 한 번만 수집. 실패한 품목은 건너뛰고 계속한다.
+async function scrapeItems(job, items, batch) {
   const results = [];
-  for (let i = 0; i < codes.length; i++) {
-    const code = codes[i];
-    hubState = { status: 'running', progress: `${i + 1}/${codes.length} ${code} 수집 중...`, percent: stepPercent(i, codes.length), error: null };
-    const r = await runHubScrape(code, fromDate, toDate, (step, label) => {
-      hubState = { status: 'running', progress: `${i + 1}/${codes.length} ${code} — ${label}`, percent: stepPercent(i, codes.length, step), error: null };
+  for (let i = 0; i < items.length; i++) {
+    const { code, from, to } = items[i];
+    job.progress = `${i + 1}/${items.length} ${code} 수집 중...`; job.percent = stepPercent(i, items.length);
+    const r = await runHubScrape(code, from, to, (step, label) => {
+      job.progress = `${i + 1}/${items.length} ${code} — ${label}`; job.percent = stepPercent(i, items.length, step);
     });
     results.push({ code, ...r });
-    if (r.exitCode !== 0) console.error(`[hub] ${code} 실패:\n${r.tail.slice(-600)}`);
-    else mergeCoverage(code, fromDate, toDate);
-    if (r.newRows && r.newRows.length) await notifyAllUsersForCode(code, r.newRows);
+    if (r.exitCode !== 0) console.error(`[hub] ${code} 실패(종료 코드 ${r.exitCode}${r.timedOut ? ', 시간 초과' : ''}):\n${(r.tail || '').slice(-600)}`);
+    else { mergeCoverage(code, from, to); batch.add(code, r.newRows); }
   }
+  await fillNewNames();
   return results;
 }
 
-// 특정 alarm_time을 가진 사용자들의 필터에서(중복 제거된) item_code만 뽑아 수집한다.
-// 크론 틱 하나당 한 번 호출됨 — "그 시간을 등록한 사용자들이 보는 품목만" 긁는다.
-async function runHubScrapeForTime(time) {
+// 자동 수집 한 번: 이 알림 시각을 쓰는 사용자들의 품목(중복 제거)을 최근 7일 기준으로 긁고 신규를 알린다.
+async function cronJobRun(job, time) {
   const { fromDate, toDate } = defaultScrapeWindow();
   // item_code 컬럼이 생기기 전에 만든 필터는 번호가 비어 있다. 키워드로 물품목록 API를 조회해
   // 이름이 정확히 일치하는 세부품명이 있으면 자동으로 채운다(사용자가 다시 등록할 필요 없게).
+  job.progress = '품목 번호 확인 중...';
   await fillMissingItemCodes();
-
   const codes = db.prepare(`
     SELECT DISTINCT f.item_code FROM filters f JOIN users u ON u.id = f.user_id
     WHERE u.alarm_time = ? AND f.item_code IS NOT NULL AND f.item_code <> ''
   `).all(time).map((r) => r.item_code);
   if (!codes.length) {
-    hubState = { status: 'done', progress: `${time}에 등록된 품목 없음`, percent: 100, error: null };
-    return;
+    job.progress = `${time}에 등록된 품목 없음`;
+  } else {
+    const batch = new NotifyBatch('cron');
+    const results = await scrapeItems(job, codes.map((code) => ({ code, from: fromDate, to: toDate })), batch);
+    job.progress = '알림 보내는 중...';
+    const sent = await batch.flush();
+    const summary = `${new Date().toLocaleString('ko-KR')} · ${results.map((r) => `${r.code} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`).join(', ')}`;
+    setSetting('last_hub_at', new Date().toISOString());
+    setSetting('last_hub_summary', summary);
+    job.progress = summary;
+    console.log(`[notify] ${time} 자동 수집: 품목 ${codes.length}개, 신규 ${sent.newTotal}건 → 알림 대상 사용자 ${sent.users}명`);
   }
-  const results = await scrapeCodesAndNotify(codes, { fromDate, toDate });
-  const summary = `${new Date().toLocaleString('ko-KR')} · ${results.map((r) => `${r.code} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`).join(', ')}`;
-  setSetting('last_hub_at', new Date().toISOString());
-  setSetting('last_hub_summary', summary);
-  hubState = { status: 'done', progress: summary, percent: 100, error: null };
+  setSetting(`cron_done:${time}`, kstYmd(0)); // 오늘 이 시각 몫은 끝났다(부팅 때 놓친 수집을 챙길 때 쓴다)
+  db.pragma('optimize');
 }
 
-// 상태 조회만 남긴다 — 수동 "지금 확인하기" 버튼은 없앴고(매일 자동 실행으로 충분, 표의
-// "조회"는 알림 없이 조회만 함), hub-query가 트는 수집의 진행 상황을 폴링하는 데 쓰인다.
-app.get('/api/hub-scrape/status', (req, res) => res.json(hubState));
+// 표 위 "조회" 버튼의 수집: 빠진 기간만 골라 긁는다.
+async function manualJobRun(job, gaps) {
+  const batch = new NotifyBatch('manual');
+  const results = await scrapeItems(job, gaps.map((g) => ({ code: g.code, from: g.gFrom, to: g.gTo })), batch);
+  job.progress = '알림 확인 중...';
+  await batch.flush();
+  const failed = results.filter((r) => r.exitCode !== 0).length;
+  job.progress = failed ? `조회 완료(${failed}건은 수집에 실패했어요)` : '조회 완료';
+  if (failed === results.length) throw new Error('조달데이터허브에서 자료를 가져오지 못했어요. 잠시 뒤에 다시 시도해 주세요.');
+}
+
+// 화면이 진행 상황을 확인한다. job을 주면 그 작업(본인이 시킨 것만), 안 주면 전체가 바쁜지만 알려준다.
+app.get('/api/hub-scrape/status', (req, res) => {
+  if (req.query.job !== undefined) {
+    const job = jobs.get(Number(req.query.job));
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ status: 'error', error: '조회 작업을 찾을 수 없어요(오래돼서 사라졌을 수 있어요)' });
+    return res.json(jobView(job));
+  }
+  res.json({ status: currentJob ? 'running' : 'idle', progress: '', percent: 0, error: null, queued: jobQueue.length });
+});
 
 // 표 위쪽 "조회" 버튼용: 이미 긁어놓은 기간이면 바로 DB에서 보여주면 되니 아무것도 안 하고,
-// 빠진 구간이 있을 때만 그 구간만 골라서 긁는다(알림은 안 보냄 — 조회는 알림과 무관).
+// 빠진 구간이 있을 때만 그 구간만 골라서 줄에 세운다.
 app.post('/api/hub-query', (req, res) => {
-  if (hubState.status === 'running') return res.status(409).json({ error: '이미 실행 중입니다' });
   const { itemCode, fromDate, toDate } = req.body || {};
   if (!/^\d{8}$/.test(fromDate || '') || !/^\d{8}$/.test(toDate || '') || fromDate > toDate) {
     return res.status(400).json({ error: '조회 기간이 올바르지 않습니다' });
   }
-  const codes = itemCode
-    ? [itemCode]
-    // "전체" 탭 조회는 내 필터만 대상으로 한다 — 다른 사용자가 보는 품목까지 긁을 필요 없음.
-    : db.prepare(`SELECT DISTINCT item_code FROM filters WHERE user_id = ? AND item_code IS NOT NULL AND item_code <> ''`).all(req.user.id).map((r) => r.item_code);
+  const mine = db.prepare(`SELECT DISTINCT item_code FROM filters WHERE user_id = ? AND item_code IS NOT NULL AND item_code <> ''`).all(req.user.id).map((r) => r.item_code);
+  let codes = mine; // "전체" 탭 조회는 내 필터만 대상으로 한다 — 다른 사용자가 보는 품목까지 긁을 필요 없음.
+  if (itemCode) {
+    // 화면은 늘 내 필터의 품목번호를 보낸다. 그 밖의 번호로는 수집을 시킬 수 없게 한다(아무 번호나 긁게 두면 자원을 낭비한다).
+    if (!/^\d{6,12}$/.test(String(itemCode)) || !mine.includes(String(itemCode))) return res.status(400).json({ error: '내 필터에 없는 품목이에요' });
+    codes = [String(itemCode)];
+  }
   if (!codes.length) return res.status(400).json({ error: '조회할 품목이 없습니다' });
 
   const gaps = [];
@@ -858,42 +930,55 @@ app.post('/api/hub-query', (req, res) => {
   }
   if (!gaps.length) return res.json({ needsScrape: false });
 
-  hubState = { status: 'running', progress: '빠진 기간 확인됨, 수집 준비 중...', percent: 0, error: null };
-  (async () => {
-    for (let i = 0; i < gaps.length; i++) {
-      const { code, gFrom, gTo } = gaps[i];
-      hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) 수집 중...`, percent: stepPercent(i, gaps.length), error: null };
-      const r = await runHubScrape(code, gFrom, gTo, (step, label) => {
-        hubState = { status: 'running', progress: `${i + 1}/${gaps.length} ${code} (${gFrom}~${gTo}) — ${label}`, percent: stepPercent(i, gaps.length, step), error: null };
-      });
-      if (r.exitCode === 0) mergeCoverage(code, gFrom, gTo);
-      else console.error(`[hub-query] ${code} (${gFrom}~${gTo}) 실패:\n${r.tail.slice(-600)}`);
-      // 수동 조회라도 "신규 계약"으로 잡힌 게 있으면(당일치만) 그 품목을 보는 모든 사용자에게
-      // 알린다 — 과거 날짜 브라우징은 notifyAllUsersForCode 안의 당일 필터가 걸러준다.
-      if (r.exitCode === 0 && r.newRows && r.newRows.length) await notifyAllUsersForCode(code, r.newRows);
-    }
-    hubState = { status: 'done', progress: '조회 완료', percent: 100, error: null };
-  })().catch((e) => { hubState = { status: 'error', progress: '', percent: 0, error: e.message }; });
-
-  res.json({ needsScrape: true, started: true });
+  try {
+    const { job, dup } = enqueueJob({ kind: 'manual', key: `manual:${req.user.id}`, userId: req.user.id, run: (j) => manualJobRun(j, gaps) });
+    res.json({ needsScrape: true, started: !dup, alreadyRunning: dup, jobId: job.id });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
 
 // 사용자마다 다른 alarm_time을 가질 수 있어, 실제로 쓰이는 시간마다 크론 job을 하나씩 띄운다.
 // 알림 시간 저장 시(POST /api/settings/alarm-time)마다, 그리고 서버 부팅 시 1번 호출된다.
+// 시각이 되면 작업을 줄에 세운다 — 다른 수집이 돌고 있어도 건너뛰지 않고 차례를 기다린다.
 let hubTasks = new Map();
+function enqueueCron(time) {
+  try { enqueueJob({ kind: 'cron', key: `cron:${time}`, run: (j) => cronJobRun(j, time) }); }
+  catch (e) { console.error(`[cron ${time}] 작업을 줄에 세우지 못했어요: ${e.message}`); }
+}
 function rescheduleAllAlarms() {
   for (const t of hubTasks.values()) t.stop();
   hubTasks.clear();
   const times = db.prepare(`SELECT DISTINCT alarm_time FROM users`).all().map((r) => r.alarm_time);
   for (const time of times) {
     const [hh, mm] = time.split(':').map(Number);
-    hubTasks.set(time, cron.schedule(`${mm} ${hh} * * *`, () => {
-      if (hubState.status === 'running') return;
-      runHubScrapeForTime(time).catch((e) => console.error('hub scrape failed:', e.message));
-    }, { timezone: 'Asia/Seoul' }));
+    hubTasks.set(time, cron.schedule(`${mm} ${hh} * * *`, () => enqueueCron(time), { timezone: 'Asia/Seoul' }));
   }
 }
 rescheduleAllAlarms();
+
+// 서버가 꺼져 있거나 배포로 재시작되는 사이에 알림 시각이 지나가 버리면 그날 수집이 통째로 빠진다. 켜진 뒤 잠시 있다가
+// "오늘 이미 지난 알림 시각인데 아직 안 돈 것"을 챙겨서 한 번 돌린다.
+// 이 기능이 처음 켜지는 날에는 "오늘 몫이 돌았다"는 기록(cron_done)이 아직 없어서, 이미 정상으로 돈 알림 시각까지 전부 다시 돌게
+// 된다 — 그래서 처음 한 번만 "지금까지 지난 시각은 이미 돌았다"고 표시하고 시작한다.
+{
+  const nowKst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(11, 16);
+  if (!getSetting('cron_catchup_init')) {
+    for (const { alarm_time: time } of db.prepare(`SELECT DISTINCT alarm_time FROM users`).all()) if (time <= nowKst) setSetting(`cron_done:${time}`, kstYmd(0));
+    setSetting('cron_catchup_init', '1');
+  }
+}
+setTimeout(() => {
+  try {
+    const nowKst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(11, 16); // HH:MM
+    for (const { alarm_time: time } of db.prepare(`SELECT DISTINCT alarm_time FROM users`).all()) {
+      if (time <= nowKst && getSetting(`cron_done:${time}`) !== kstYmd(0)) {
+        console.log(`[cron ${time}] 오늘 몫이 아직 안 돌아서 지금 챙깁니다(서버가 꺼져 있었을 수 있어요)`);
+        enqueueCron(time);
+      }
+    }
+  } catch (e) { console.error('[cron] 놓친 수집 확인 실패:', e.message); }
+}, Number(process.env.CATCHUP_DELAY_MS) || 90 * 1000).unref();
 
 // 재시작 뒤에도 알림 설정이 남아 있는지 로그만 보고 알 수 있게, 부팅 때 요약을 남긴다(개수·시간만).
 {
@@ -903,5 +988,38 @@ rescheduleAllAlarms();
   console.log(`[boot] 관리자 ${[...ADMIN_USERNAMES].join(',')} · 사용자 ${n('SELECT COUNT(*) c FROM users')}명 · 필터 ${n('SELECT COUNT(*) c FROM filters')}건 · 푸시 구독 ${n('SELECT COUNT(*) c FROM push_subscriptions')}건 · 알림 시간 ${times}`);
 }
 
+// 만료된 세션은 조회에서만 걸러지고 지워지지 않아 계속 쌓인다 — 부팅 때와 6시간마다 정리한다
+function purgeExpiredSessions() {
+  try {
+    const n = db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(new Date().toISOString()).changes;
+    if (n) console.log(`[db] 만료된 세션 ${n}건 정리`);
+    db.pragma('optimize'); // 표가 바뀐 만큼 조회 통계를 갱신한다
+  } catch (e) { console.error('[db] 세션 정리 실패:', e.message); }
+}
+purgeExpiredSessions();
+setInterval(purgeExpiredSessions, 6 * 60 * 60 * 1000).unref();
+
+// 처리 안 된 Promise 오류 하나로 서버 전체가 죽지 않게 로그만 남긴다(Node 기본값은 프로세스 종료)
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e && e.stack ? e.stack : e));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));
+// 포트를 못 잡으면(이미 쓰는 중 등) 조용히 살아 있지 말고 바로 종료한다 — 크론 때문에 프로세스가 안 죽어서
+// 요청을 못 받는 서버가 떠 있게 되는 걸 막고, 재시작 정책(restart: unless-stopped)이 다시 시도하게 한다.
+const server = app.listen(PORT, () => console.log(`g2b-alert listening on ${PORT}`));
+server.on('error', (e) => { console.error(`[server] ${PORT} 포트를 열지 못했습니다: ${e.message}`); process.exit(1); });
+server.keepAliveTimeout = 65 * 1000; // nginx·모바일 망의 유휴 연결 재사용
+server.headersTimeout = 66 * 1000;
+
+// docker가 종료 신호(SIGTERM)를 보내면: 새 연결을 받지 않고, 돌고 있던 수집 프로세스를 정리하고, DB를 깨끗이 닫아(WAL 정리) 종료한다.
+let shuttingDown = false;
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${sig} 수신 — 정리 후 종료합니다`);
+  for (const t of hubTasks.values()) t.stop();
+  try { if (typeof killScrapeChild === 'function') killScrapeChild(); } catch (e) { /* 이미 끝났을 수 있음 */ }
+  server.close(() => { try { db.close(); } catch (e) { /* 사용 중인 연결이 남아 있을 수 있음 */ } process.exit(0); });
+  setTimeout(() => process.exit(0), 8000).unref(); // docker 기본 종료 대기(10초) 안에 끝낸다
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

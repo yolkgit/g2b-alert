@@ -14,9 +14,7 @@ const MIN_ROWS_TO_INDEX = 3;
 // 허브 자료는 하루 몇 번(크론·수동 조회) 바뀌는 게 전부라 집계 결과를 잠깐 들고 있는다.
 const CACHE_MS = 10 * 60 * 1000;
 
-// 같은 계약이 변경될 때마다 변경차수별 행이 따로 쌓이므로 집계는 최종 변경분만 센다
-// (안 그러면 변경된 계약의 건수·금액이 두 번 잡힌다).
-const FINAL_ONLY = `COALESCE(json_extract(raw_json, '$."최종계약(납품요구)여부"'), 'Y') != 'N'`;
+const hubq = require('./hubquery');
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 function num(s) {
@@ -43,6 +41,14 @@ function topicJosa(word) {
 // JSON-LD를 <script> 안에 넣을 때 "</script>"로 태그가 끊기지 않게 <를 이스케이프한다.
 const jsonLdTag = (obj) => `<script type="application/ld+json">${JSON.stringify(obj).replace(/</g, '\\u003c')}</script>`;
 
+// 첫 화면 HTML은 요청마다 디스크에서 읽지 않고(동기 읽기가 서버를 잠깐 멈춘다) 파일이 바뀌었을 때만 다시 읽는다
+let indexCache = { mtimeMs: 0, html: '' };
+function readIndexHtml() {
+  const st = fs.statSync(INDEX_HTML);
+  if (st.mtimeMs !== indexCache.mtimeMs) indexCache = { mtimeMs: st.mtimeMs, html: fs.readFileSync(INDEX_HTML, 'utf8') };
+  return indexCache.html;
+}
+
 const cache = new Map();
 function cached(key, fn) {
   const hit = cache.get(key);
@@ -53,13 +59,10 @@ function cached(key, fn) {
 }
 
 // ─── 데이터 ──────────────────────────────────────────────
+// 같은 계약이 변경될 때마다 변경차수별 행이 따로 쌓이므로 집계는 최종 변경분만 센다(안 그러면 변경된 계약의 건수·금액이
+// 두 번 잡힌다). 그 구분과 집계는 hubquery.js의 가벼운 색인 표(hub_idx)가 맡는다.
 function listItems(db) {
-  return cached('items', () => db.prepare(`
-    SELECT item_code code, COUNT(*) n, MIN(contract_date) first, MAX(contract_date) last,
-           MAX(json_extract(raw_json, '$."세부품명"')) name
-    FROM hub_items WHERE item_code IS NOT NULL AND ${FINAL_ONLY}
-    GROUP BY item_code ORDER BY n DESC
-  `).all().map((r) => ({ ...r, name: r.name || r.code })));
+  return cached('items', () => hubq.publicItems(db).map((r) => ({ ...r, name: r.name || r.code })));
 }
 
 const UNIT_ALIASES = { ton: '톤', t: '톤', ea: '개', kg: 'kg' };
@@ -75,7 +78,7 @@ function groupTop(rows, key, sortKey, limit) {
     if (!k) continue;
     const e = m.get(k) || { name: k, n: 0, amount: 0 };
     e.n += 1;
-    e.amount += num(r['공급금액']) || 0;
+    e.amount += r.amount || 0;
     m.set(k, e);
   }
   return [...m.values()].sort((a, b) => b[sortKey] - a[sortKey] || b.n - a.n).slice(0, limit);
@@ -84,20 +87,17 @@ function groupTop(rows, key, sortKey, limit) {
 // listItems에 있는 코드만 넘어온다(아무 번호로나 찔러서 캐시가 무한정 커지는 걸 막기 위해).
 function getItemData(db, code) {
   return cached(`item:${code}`, () => {
-    const rows = db.prepare(`
-      SELECT raw_json FROM hub_items WHERE item_code = ? AND ${FINAL_ONLY}
-      ORDER BY contract_date DESC, contract_no DESC
-    `).all(code).map((r) => JSON.parse(r.raw_json));
+    const { rows, recent } = hubq.publicItemRows(db, code, 30); // rows: 통계용 좁은 열 전체(최신순), recent: 최근 30건 원본
 
     // 단위가 포·kg·25kg/포처럼 제각각이라 단가는 단위별로 따로 본다. 평균은 이상치에
     // 휘둘려서 중간값을 쓴다. 총액 일괄 계약이 "수량 1, 단가=공급금액"으로 들어온 행
     // (예: 1kg에 9억)은 단가가 아니라서 뺀다.
     const byUnit = new Map();
     for (const r of rows) {
-      const p = num(r['계약납품단가']);
+      const p = r.price;
       if (!p || p <= 0) continue;
-      if ((num(r['계약납품수량']) || 0) <= 1 && p === num(r['공급금액'])) continue;
-      const u = normUnit(r['단위']) || '(단위 없음)';
+      if ((r.qty || 0) <= 1 && p === r.amount) continue;
+      const u = normUnit(r.unit) || '(단위 없음)';
       if (!byUnit.has(u)) byUnit.set(u, []);
       byUnit.get(u).push(p);
     }
@@ -112,14 +112,14 @@ function getItemData(db, code) {
 
     return {
       n: rows.length,
-      first: rows.length ? rows[rows.length - 1]['계약(납품요구)일자'] : '',
-      last: rows.length ? rows[0]['계약(납품요구)일자'] : '',
-      total: rows.reduce((s, r) => s + (num(r['공급금액']) || 0), 0),
+      first: rows.length ? rows[rows.length - 1].cdate : '',
+      last: rows.length ? rows[0].cdate : '',
+      total: rows.reduce((s, r) => s + (r.amount || 0), 0),
       units,
       topUnit,
-      agencies: groupTop(rows, '수요기관', 'n', 10),
-      suppliers: groupTop(rows, '업체명', 'amount', 10),
-      recent: rows.slice(0, 30),
+      agencies: groupTop(rows, 'org', 'n', 10),
+      suppliers: groupTop(rows, 'company', 'amount', 10),
+      recent,
     };
   });
 }
@@ -269,7 +269,7 @@ function registerSeoRoutes(app, { db, getSessionUser }) {
   // 로그인 상태면 <html class="authed">로 내려 소개 화면이 깜빡이지 않게 하고, 공개 품목
   // 링크를 박아서 크롤러가 홈에서 품목 페이지로 따라 들어올 수 있게 한다.
   app.get('/', (req, res) => {
-    let html = fs.readFileSync(INDEX_HTML, 'utf8');
+    let html = readIndexHtml();
     if (getSessionUser(req)) html = html.replace('<html lang="ko">', '<html lang="ko" class="authed">');
     html = html.replace('<!--ITEM_LINKS-->', renderHomeItemLinks(listItems(db)));
     res.set('Cache-Control', 'no-cache').type('html').send(html);
