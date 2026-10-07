@@ -843,7 +843,7 @@ async function fillNewNames() {
 }
 
 // 품목들을 하나씩(중복 없이) 긁는다 — 여러 사용자가 같은 품목을 봐도 한 번만 수집. 실패한 품목은 건너뛰고 계속한다.
-async function scrapeItems(job, items, batch) {
+async function scrapeItems(job, items, batch, onSuccess) {
   const results = [];
   for (let i = 0; i < items.length; i++) {
     const { code, from, to } = items[i];
@@ -853,11 +853,17 @@ async function scrapeItems(job, items, batch) {
     });
     results.push({ code, ...r });
     if (r.exitCode !== 0) console.error(`[hub] ${code} 실패(종료 코드 ${r.exitCode}${r.timedOut ? ', 시간 초과' : ''}):\n${(r.tail || '').slice(-600)}`);
-    else { mergeCoverage(code, from, to); batch.add(code, r.newRows); }
+    else { mergeCoverage(code, from, to); batch.add(code, r.newRows); if (onSuccess) onSuccess(code); }
   }
   await fillNewNames();
   return results;
 }
+
+// 품목 하나를 수집하는 데 약 2분이 걸리고 수집은 한 줄로 돌기 때문에, 하루 수집 시간은 "서로 다른 품목 수 × 2분"이다. 알림 시각이
+// 사용자마다 달라 같은 품목이 시각마다 또 수집되면(예: 07:00과 09:10) 그만큼 낭비다. 허브 자료는 하루에 한 번 정도 바뀌고, 새로 발견된
+// 건은 그 품목을 보는 모든 사용자에게 바로 알림이 가므로(위 알림 규칙), 최근에 정상 수집한 품목은 건너뛰어도 알림이 빠지지 않는다.
+const RESCRAPE_MIN_MS = Number(process.env.RESCRAPE_MIN_MS) || 6 * 3600 * 1000;
+const scrapedRecently = (code) => { const at = Date.parse(getSetting(`scraped_at:${code}`) || ''); return Number.isFinite(at) && Date.now() - at < RESCRAPE_MIN_MS; };
 
 // 자동 수집 한 번: 이 알림 시각을 쓰는 사용자들의 품목(중복 제거)을 최근 7일 기준으로 긁고 신규를 알린다.
 async function cronJobRun(job, time) {
@@ -870,18 +876,22 @@ async function cronJobRun(job, time) {
     SELECT DISTINCT f.item_code FROM filters f JOIN users u ON u.id = f.user_id
     WHERE u.alarm_time = ? AND f.item_code IS NOT NULL AND f.item_code <> ''
   `).all(time).map((r) => r.item_code);
+  const todo = codes.filter((c) => !scrapedRecently(c));
+  if (codes.length && todo.length < codes.length) console.log(`[cron ${time}] 품목 ${codes.length}개 중 ${codes.length - todo.length}개는 최근 ${Math.round(RESCRAPE_MIN_MS / 3600000)}시간 안에 이미 수집해서 건너뜁니다`);
   if (!codes.length) {
     job.progress = `${time}에 등록된 품목 없음`;
+  } else if (!todo.length) {
+    job.progress = '모든 품목을 최근에 수집해서 건너뜀';
   } else {
     const batch = new NotifyBatch('cron');
-    const results = await scrapeItems(job, codes.map((code) => ({ code, from: fromDate, to: toDate })), batch);
+    const results = await scrapeItems(job, todo.map((code) => ({ code, from: fromDate, to: toDate })), batch, (code) => setSetting(`scraped_at:${code}`, new Date().toISOString()));
     job.progress = '알림 보내는 중...';
     const sent = await batch.flush();
     const summary = `${new Date().toLocaleString('ko-KR')} · ${results.map((r) => `${r.code} ${r.exitCode === 0 ? `${r.count ?? '?'}건` : '실패'}`).join(', ')}`;
     setSetting('last_hub_at', new Date().toISOString());
     setSetting('last_hub_summary', summary);
     job.progress = summary;
-    console.log(`[notify] ${time} 자동 수집: 품목 ${codes.length}개, 신규 ${sent.newTotal}건 → 알림 대상 사용자 ${sent.users}명`);
+    console.log(`[notify] ${time} 자동 수집: 품목 ${todo.length}개, 신규 ${sent.newTotal}건 → 알림 대상 사용자 ${sent.users}명`);
   }
   setSetting(`cron_done:${time}`, kstYmd(0)); // 오늘 이 시각 몫은 끝났다(부팅 때 놓친 수집을 챙길 때 쓴다)
   db.pragma('optimize');
