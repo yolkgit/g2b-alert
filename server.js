@@ -891,7 +891,9 @@ async function cronJobRun(job, time) {
     setSetting('last_hub_at', new Date().toISOString());
     setSetting('last_hub_summary', summary);
     job.progress = summary;
-    console.log(`[notify] ${time} 자동 수집: 품목 ${todo.length}개, 신규 ${sent.newTotal}건 → 알림 대상 사용자 ${sent.users}명`);
+    // 일부가 실패해도 작업은 "완료"로 끝나므로(실패한 품목은 다음 알림 시각에 다시 시도된다) 로그에서 눈에 띄게 남긴다
+    const failedCodes = results.filter((r) => r.exitCode !== 0).map((r) => r.code);
+    console.log(`[notify] ${time} 자동 수집: 품목 ${todo.length}개, 신규 ${sent.newTotal}건 → 알림 대상 사용자 ${sent.users}명${failedCodes.length ? ` · ⚠ 수집 실패 ${failedCodes.length}개(${failedCodes.join(', ')})` : ''}`);
   }
   setSetting(`cron_done:${time}`, kstYmd(0)); // 오늘 이 시각 몫은 끝났다(부팅 때 놓친 수집을 챙길 때 쓴다)
   db.pragma('optimize');

@@ -29,7 +29,7 @@ const COLS = {
   '공급금액': { c: 'amount', num: true },
 };
 const SORTABLE_COLS = new Set(Object.keys(COLS));
-const INDEX_VERSION = '4';
+const INDEX_VERSION = '5';
 
 // ─── 지역 ─────────────────────────────────────────────────────────
 // 지역은 수요기관 소재지("경기도 수원시 권선구")에 대해 맞춘다. 원본이 정식 명칭이라 "충남"·"서울시"·
@@ -176,12 +176,17 @@ function ensureHubIndex(db) {
     for (const t of ['trg_hub_idx_ai', 'trg_hub_idx_au', 'trg_hub_idx_ad']) db.exec(`DROP TRIGGER IF EXISTS ${t}`);
     db.exec('DELETE FROM hub_idx');
   }
+  // 트리거 안에서 "INSERT OR REPLACE"를 쓰면 안 된다: 트리거를 일으킨 바깥 문장에 충돌 정책이 있으면(수집 스크립트의
+  // INSERT … ON CONFLICT DO UPDATE가 그렇다) 안쪽 OR REPLACE가 무시되고 UNIQUE 오류로 그 품목 수집분이 통째로 롤백된다.
+  // 그래서 먼저 지우고(DELETE는 충돌 정책과 무관) 그냥 넣는다.
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_hub_idx_ai AFTER INSERT ON hub_items BEGIN
-    INSERT OR REPLACE INTO hub_idx (${cols}) SELECT ${idxSelect('new')}; END`);
+    DELETE FROM hub_idx WHERE id = new.rowid;
+    INSERT INTO hub_idx (${cols}) SELECT ${idxSelect('new')}; END`);
   // 수집 스크립트는 같은 행을 다시 긁을 때마다 UPDATE(ON CONFLICT DO UPDATE)하므로, 내용이 실제로 바뀐 때만 갱신한다
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_hub_idx_au AFTER UPDATE OF raw_json, item_code, contract_date ON hub_items
     WHEN new.raw_json IS NOT old.raw_json OR new.item_code IS NOT old.item_code OR new.contract_date IS NOT old.contract_date BEGIN
-    INSERT OR REPLACE INTO hub_idx (${cols}) SELECT ${idxSelect('new')}; END`);
+    DELETE FROM hub_idx WHERE id = new.rowid;
+    INSERT INTO hub_idx (${cols}) SELECT ${idxSelect('new')}; END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_hub_idx_ad AFTER DELETE ON hub_items BEGIN
     DELETE FROM hub_idx WHERE id = old.rowid; END`);
 
