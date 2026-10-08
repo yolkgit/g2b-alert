@@ -230,6 +230,17 @@ async function dismissDialog(page, frame) {
 
 function fmt(d) { return `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}`; }
 
+// 고정 대기(waitForTimeout) 대신 "원하는 상태가 되면 바로" 넘어간다. 최대 maxMs까지만 기다리고(= 예전 고정 대기와 같은 값),
+// 그때까지 조건이 안 맞으면 false를 돌려줄 뿐 예외는 던지지 않는다 — 그 뒤 동작은 예전과 똑같다.
+async function waitUntil(page, cond, maxMs, pollMs = 250) {
+  const end = Date.now() + maxMs;
+  for (;;) {
+    if (await Promise.resolve().then(cond).catch(() => false)) return true;
+    if (Date.now() + pollMs >= end) return false;
+    await page.waitForTimeout(pollMs);
+  }
+}
+
 // 도커(alpine)에서는 이미지에 설치된 chromium을 쓰고(CHROMIUM_PATH), 로컬에서는
 // playwright가 받아둔 브라우저를 그대로 쓴다. 컨테이너는 root로 돌아서 sandbox를 끈다.
 function launchOpts() {
@@ -257,7 +268,12 @@ async function openReportOnce(ctx) {
   const popup = await popupPromise;
   const target = popup || page;
   await target.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
-  await target.waitForTimeout(12000);
+  // 고정 12초 대신: 조회물품 선택칸이 보이면(실측 로딩 후 약 3초) 위젯이 자리잡도록 2초만 더 두고 넘어간다.
+  await waitUntil(target, async () => {
+    for (const f of target.frames()) if (await f.locator(sel(ID.itemKindSelect)).isVisible().catch(() => false)) return true;
+    return false;
+  }, 12000);
+  await target.waitForTimeout(2000);
   return target;
 }
 
@@ -322,12 +338,27 @@ async function searchRange(page, form, dFrom, dTo) {
   if (gotFrom !== fmt(dFrom) || gotTo !== fmt(dTo)) {
     throw new Error(`기간 설정 실패 (요청 ${fmt(dFrom)}~${fmt(dTo)}, 실제 ${gotFrom}~${gotTo})`);
   }
-  await form.selectOption(sel(ID.pageSize), '100').catch(() => {});
+  // 기본 대기(30초)를 그대로 두면 이 요소가 없는 화면에서 30초가 통째로 사라진다(실측: 운영에서 매번 30.0초).
+  const sizeErr = await form.selectOption(sel(ID.pageSize), '100', { timeout: 2000 }).then(() => null, (e) => e.message.split('\n')[0]);
+  if (sizeErr) log(`   [페이지 크기] 설정 못 함(무시): ${sizeErr.slice(0, 90)}`);
   await form.click(sel(ID.searchBtn), { timeout: 20000 });
-  await page.waitForTimeout(3000);
-  const warned = await dismissDialog(page, form);
+
+  // 고정 13초(3초 + 10초) 대신 결과표가 나타나 안정되면 바로 넘어간다. 결과가 없거나 늦으면 예전과 같은 13초까지 기다린다.
+  // 검증 경고창은 예전처럼 3초가 지난 뒤부터 확인한다(그 전에는 로딩 중 화면과 헷갈릴 수 있다).
+  const t0 = Date.now();
+  let warned = null, dialogChecked = false, lastCount = -1;
+  await waitUntil(page, async () => {
+    // 경고창 확인은 예전처럼 딱 한 번만 한다(반복하면 로딩 중 화면의 문구를 경고로 오인할 수 있다)
+    if (!dialogChecked && Date.now() - t0 >= 3000) { dialogChecked = true; warned = await dismissDialog(page, form); if (warned) return true; }
+    const f = page.frames().find((x) => x.name() === 'mstrFrame' && x.url() !== 'about:blank');
+    if (!f) return false;
+    const n = (await extractRows(f)).length;
+    const stable = n > 0 && n === lastCount; // 표가 아직 그려지는 중이면 행 수가 계속 늘어난다
+    lastCount = n;
+    return stable;
+  }, 13000, 400);
+  if (!dialogChecked) warned = await dismissDialog(page, form); // 결과가 3초 전에 떠서 위에서 못 한 경우
   if (warned) throw new Error('검증 경고: ' + warned.slice(0, 100));
-  await page.waitForTimeout(10000);
 
   let mstr = null;
   for (let i = 0; i < 12; i++) {
@@ -386,7 +417,10 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
 
   log('\n2. 조회물품을 "세부품명"으로 변경...');
   await form.click(sel(ID.itemKindSelect), { timeout: 20000 });
-  await page.waitForTimeout(1500);
+  // 고정 1.5초 대신: 드롭다운 옵션("세부품명")이 DOM에 생기면 바로(최대 1.5초)
+  const kindOptions = () => form.evaluate(() => [...document.querySelectorAll('div,td,li,span')]
+    .filter((e) => e.textContent.trim() === '세부품명' && e.offsetParent !== null).length);
+  await waitUntil(page, async () => (await kindOptions()) > 0, 1500);
   await shot(page, '2-dropdown');
   // 드롭다운이 열리면 옵션 목록이 DOM에 생긴다. "세부품명" 텍스트를 가진 항목 클릭.
   const picked = await form.evaluate(() => {
@@ -397,7 +431,9 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
     return cands.length;
   });
   log('   "세부품명" 후보 수:', picked);
-  await page.waitForTimeout(2500);
+  // 고정 2.5초 대신: 선택칸에 "세부품명"이 반영되면 바로(최대 2.5초)
+  await waitUntil(page, async () => /세부품명/.test(await form.textContent(sel(ID.itemKindSelect))), 2500);
+  await page.waitForTimeout(300);
   const kindNow = await form.textContent(sel(ID.itemKindSelect)).catch(() => '?');
   log('   현재 조회물품 =', (kindNow || '').replace(/\s+/g, ' ').trim().slice(0, 40));
   await shot(page, '3-kind-set');
@@ -408,7 +444,16 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
   await setInputValue(form, ID.pickCode, code);
   log('   세부품명번호 입력:', await readValue(form, ID.pickCode));
   await form.click(sel(ID.pickSearch), { timeout: 15000 });
-  await page.waitForTimeout(6000);
+  // 고정 6초 대신: 첫 행에 우리가 찾는 번호가 떠 있으면 바로(최대 6초). 검색 전 목록의 첫 행을 잘못 고르는 일도 막는다.
+  await waitUntil(page, () => form.evaluate(({ id, code }) => {
+    // 체크박스에서 위로 올라가며 "행 하나 크기"(글자 400자 이하) 안에서 번호가 보이는지 본다(표가 table이든 div 격자든 동작)
+    for (let el = document.getElementById(id), i = 0; el && i < 6; el = el.parentElement, i++) {
+      const t = el.innerText || '';
+      if (t.length > 400) return false;
+      if (t.includes(code)) return true;
+    }
+    return false;
+  }, { id: ID.pickRow0, code }), 6000);
   await shot(page, '3a-picker');
 
   const rowFound = await form.evaluate((id) => !!document.getElementById(id), ID.pickRow0);
@@ -420,7 +465,9 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
   await form.click(sel(ID.pickRow0), { timeout: 10000 });
   await page.waitForTimeout(800);
   await form.click(sel(ID.pickConfirm), { timeout: 10000 });
-  await page.waitForTimeout(3000);
+  // 고정 3초 대신: 선택된 품목이 입력칸에 반영되면 바로(최대 3초)
+  await waitUntil(page, async () => !!(await readValue(form, ID.itemInput)), 3000);
+  await page.waitForTimeout(500);
   log('   선택됨 →', await readValue(form, ID.itemInput));
   await shot(page, '3c-picked');
 
