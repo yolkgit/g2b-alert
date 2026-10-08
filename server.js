@@ -401,7 +401,8 @@ app.post('/api/filters', (req, res) => {
   if (dup) return res.status(409).json({ error: '이미 추가된 품목·지역이에요' });
   const info = db.prepare(`INSERT INTO filters (user_id, keyword, region, item_code, created_at) VALUES (?, ?, ?, ?, ?)`)
     .run(req.user.id, kw, rg || null, code || null, new Date().toISOString());
-  res.json({ id: info.lastInsertRowid });
+  // 처음 보는 품목이면 지금 바로 자료를 모아 둔다 — 조회 버튼을 누를 때쯤엔 이미 준비되어 있게(없으면 jobId 없음)
+  res.json({ id: info.lastInsertRowid, jobId: startPrefetch(req.user.id, code) });
 });
 app.delete('/api/filters/:id', (req, res) => {
   const info = db.prepare(`DELETE FROM filters WHERE id = ? AND user_id = ?`).run(req.params.id, req.user.id);
@@ -735,7 +736,8 @@ async function sendPushToUser(userId, payload) {
 // 한 작업(수집 한 번)에서 새로 발견된 행을 모아 두었다가, 사용자마다 알림 한 번으로 묶어 보낸다
 // (품목이 여러 개여도 아침에 푸시가 줄줄이 오지 않게).
 class NotifyBatch {
-  constructor(mode) { this.mode = mode; this.byCode = new Map(); }
+  // skipUserId: 이 사용자에게는 보내지 않는다(품목을 막 추가해서 화면으로 결과를 보고 있는 본인). 나머지 사용자에게는 그대로 보낸다.
+  constructor(mode, skipUserId = null) { this.mode = mode; this.skipUserId = skipUserId; this.byCode = new Map(); }
   add(code, rows) { if (rows && rows.length) this.byCode.set(code, (this.byCode.get(code) || []).concat(rows)); }
   async flush() {
     const perUser = new Map(); // userId → Map(code → { keyword, rows })
@@ -751,6 +753,7 @@ class NotifyBatch {
         filtersByUser.set(f.user_id, l);
       }
       for (const [userId, list] of filtersByUser) {
+        if (userId === this.skipUserId) continue;
         for (const r of rows) {
           const hit = list.find((x) => x.match(r)); // 지역이 하나라도 맞는 필터가 있으면 그 사용자의 신규 건
           if (!hit) continue;
@@ -900,14 +903,35 @@ async function cronJobRun(job, time) {
 }
 
 // 표 위 "조회" 버튼의 수집: 빠진 기간만 골라 긁는다.
-async function manualJobRun(job, gaps) {
-  const batch = new NotifyBatch('manual');
+async function manualJobRun(job, requested, quietUserId = null) {
+  // 줄을 서 있는 동안 앞선 작업(같은 품목을 추가한 다른 사용자, 방금 끝난 준비 수집 등)이 이미 채운 구간은 빼고 시작한다
+  const gaps = requested.flatMap((g) => findMissingRanges(g.code, g.gFrom, g.gTo).map(([gFrom, gTo]) => ({ code: g.code, gFrom, gTo })));
+  if (!gaps.length) { job.progress = '이미 수집되어 있어요'; return; }
+  const batch = new NotifyBatch('manual', quietUserId);
   const results = await scrapeItems(job, gaps.map((g) => ({ code: g.code, from: g.gFrom, to: g.gTo })), batch);
   job.progress = '알림 확인 중...';
   await batch.flush();
   const failed = results.filter((r) => r.exitCode !== 0).length;
   job.progress = failed ? `조회 완료(${failed}건은 수집에 실패했어요)` : '조회 완료';
   if (failed === results.length) throw new Error('조달데이터허브에서 자료를 가져오지 못했어요. 잠시 뒤에 다시 시도해 주세요.');
+}
+
+// 품목을 추가한 직후 그 품목의 자료를 미리 수집해 둔다. 기간은 조회 화면의 기본값(한 달 전~어제)과 같고, 이미 긁어 둔 구간은
+// 빼므로 다른 사용자가 보던 품목이면 대개 할 일이 없다(jobId 없음). 규칙은 수동 "조회"와 같다: 수집은 줄을 서서 차례로, 새로 발견된
+// 최근 건은 그 품목을 보는 사용자에게 알림 — 다만 방금 추가해서 화면으로 결과를 보고 있는 본인에게는 보내지 않는다.
+// 필터 추가 자체는 수집이 안 돼도(품목번호 이상·대기열 가득·사용자당 한도) 항상 성공해야 해서 실패하면 조용히 null을 돌려준다.
+const PREFETCH_DAYS = 30;
+const PREFETCH_PER_USER_MAX = 3; // 한 사용자가 줄에 올려 둘 수 있는 수동 수집 수(필터를 연달아 추가·삭제하며 줄을 채우지 못하게)
+function startPrefetch(userId, code) {
+  if (!/^\d{6,12}$/.test(code || '')) return null;
+  const gaps = findMissingRanges(code, kstYmd(-PREFETCH_DAYS), kstYmd(-1)).map(([gFrom, gTo]) => ({ code, gFrom, gTo }));
+  if (!gaps.length) return null;
+  let mine = 0;
+  for (const j of jobs.values()) if (j.userId === userId && j.kind === 'manual' && (j.state === 'queued' || j.state === 'running')) mine++;
+  if (mine >= PREFETCH_PER_USER_MAX) return null;
+  try {
+    return enqueueJob({ kind: 'manual', key: `prefetch:${userId}:${code}`, userId, run: (j) => manualJobRun(j, gaps, userId) }).job.id;
+  } catch (e) { return null; }
 }
 
 // 화면이 진행 상황을 확인한다. job을 주면 그 작업(본인이 시킨 것만), 안 주면 전체가 바쁜지만 알려준다.

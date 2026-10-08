@@ -618,12 +618,14 @@ async function addFilterFromSearch(keyword, itemCode) {
   const err = document.getElementById('item-search-err');
   err.textContent = '';
   try {
-    await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region, itemCode }) });
+    const added = await api('/api/filters', { method: 'POST', body: JSON.stringify({ keyword, region, itemCode }) });
     document.getElementById('item-search').value = '';
     document.getElementById('item-search-results').innerHTML = '';
     if (window.matchMedia('(pointer:fine)').matches) document.getElementById('item-search').focus(); // 폰은 키보드가 올라와서 제외
     await loadFilters();
     await loadContracts(); // 탭 건수는 필터별이라 새 필터 건수를 다시 받아와야 한다(삭제할 때와 같게)
+    // 처음 보는 품목이면 서버가 지금 자료를 모으고 있다 — 끝나면 표를 새로 고친다(조회 버튼을 누른 것과 같은 진행 표시)
+    if (added && added.jobId) followNewJob(added.jobId);
   } catch (e) { err.textContent = e.message; }
 }
 
@@ -1212,11 +1214,25 @@ async function runQuery() {
 
 // 조회 작업이 끝날 때까지 2초마다 진행 상황을 확인한다. 서버가 잠시 응답하지 못해도(재시작 등) 몇 번은 다시 시도하고,
 // 계속 안 되면 버튼을 풀어 준다(예전에는 한 번 실패하면 "조회 중..."이 영원히 남았다).
-let jobPoll = null;
+let jobPoll = null, followingId = null;
+const pendingJobs = []; // 이미 다른 작업을 따라가는 중에 새로 생긴 작업(품목을 연달아 추가한 경우) — 앞 작업이 끝나면 이어서 따라간다
+// 품목을 추가하면 서버가 시작한 자료 수집을 따라간다(조회 버튼은 그동안 "조회 중"으로 잠긴다).
+function followNewJob(jobId) {
+  if (jobId === followingId || pendingJobs.includes(jobId)) return; // 같은 품목을 또 추가해 서버가 같은 작업 번호를 돌려준 경우
+  if (jobPoll) { pendingJobs.push(jobId); return; }
+  const btn = document.getElementById('query-btn'), err = document.getElementById('query-err');
+  btn.disabled = true; btn.textContent = '대기 중...';
+  followJob(jobId, btn, err);
+}
 function followJob(jobId, btn, err) {
   clearInterval(jobPoll);
+  followingId = jobId;
   let fails = 0, busy = false;
-  const stop = () => { clearInterval(jobPoll); jobPoll = null; btn.disabled = false; btn.textContent = '조회'; updateHubProgress({ status: 'idle' }); };
+  const stop = () => {
+    clearInterval(jobPoll); jobPoll = null; followingId = null; btn.disabled = false; btn.textContent = '조회'; updateHubProgress({ status: 'idle' });
+    const next = pendingJobs.shift();
+    if (next) followNewJob(next);
+  };
   jobPoll = setInterval(async () => {
     if (busy) return;
     busy = true;
