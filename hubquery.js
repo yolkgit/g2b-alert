@@ -116,16 +116,20 @@ function cleanItemName(row) {
 // 허브 자료에는 제품 속성이 아니라 "그 계약이 어떤 제도로 체결됐는지"만 있다 — 우수제품여부 = 'Y'(우수조달물품 구매),
 // 조항호내용에 "…에 따른 혁신제품"(혁신제품 수의계약의 법적 근거). 같은 제품도 다른 방식(다수공급자 등)으로 계약되면 이 값이 비어서,
 // 행마다 보면 대부분 놓친다(실측: 우수 39개 제품 중 13개가 일부 행만 표시, 표시가 빠진 행 1,033건). 그래서 같은 제품(물품식별번호)의
-// 어느 행이든 기록이 있으면 그 제품의 모든 행에 붙인다. 비트: 1 = 혁신제품, 2 = 우수제품.
+// 어느 행이든 기록이 있으면 그 제품의 모든 행에 붙인다(특정된 제품만 — 아래 isSpecificProduct). 비트: 1 = 혁신제품, 2 = 우수제품.
 const MK_INNOVATIVE = 1, MK_EXCELLENT = 2;
 const rowMarks = (j) => (/혁신제품/.test(j['조항호내용'] || '') ? MK_INNOVATIVE : 0) | (j['우수제품여부'] === 'Y' ? MK_EXCELLENT : 0);
 const markPrefix = (mk) => ((mk & MK_INNOVATIVE) ? '[혁신제품]' : '') + ((mk & MK_EXCELLENT) ? '[우수제품]' : '') + (mk ? ' ' : '');
 // 엑셀 한 칸의 값: 품목명 앞에는 표시를 글자로 붙인다(화면의 배지와 같은 정보)
 const exportCell = (j, col) => (col === '품목명' ? markPrefix(j['제품표시'] | 0) : '') + (j[col] ?? '');
+// 제품 단위 전파는 "특정된 제품"에만 한다. 품목명이 세부품명 그대로(제조사·모델이 없음)인 행은 여러 업체가 같은 번호를 함께 쓰는 일반 품목이라
+// (실측: 도로포장용보수재 번호 하나에 업체 140곳) 한두 행의 근거로 나머지를 칠하면 수백 건이 잘못 표시된다. 그런 행은 자기 근거만 본다.
+const isSpecificProduct = (j) => { const n = String(j['품목명'] || '').trim(), d = String(j['세부품명'] || '').trim(); return !!n && n !== d; };
 const toDisplayRow = (rawJson, productMk) => {
   const j = JSON.parse(rawJson);
+  const own = rowMarks(j), specific = isSpecificProduct(j); // 이름을 정리하기 전의 원본 품목명으로 판단한다
   j['품목명'] = cleanItemName(j);
-  j['제품표시'] = rowMarks(j) | ((productMk && productMk.get(j['물품식별번호'])) || 0);
+  j['제품표시'] = own | (specific && productMk ? productMk.get(j['물품식별번호']) || 0 : 0);
   return j;
 };
 // 품목명 정렬 키. SQLite에는 한국어 정렬(ICU)이 없어서, 한국어 정렬 규칙("기호 < 숫자 < 한글 < 영문", 대소문자·호환 문자
