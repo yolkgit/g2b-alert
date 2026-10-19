@@ -55,9 +55,14 @@ const readValue = (frame, id) => frame.evaluate(
 // 달력 위젯을 실제로 조작해서 기간을 설정한다(내부 모델까지 갱신되도록).
 // 달력 토글 → 시작/종료 각각 연·월 선택 후 해당 일자 셀 클릭 → 선택완료
 async function setCalendarRange(page, frame, fromYmd, toYmd) {
+  // 순서가 중요하다: 이 위젯은 시작일이 (지금 들어 있는) 종료일보다 뒤가 되는 선택을 무시한다(실측: 구간을 앞으로 옮겨 가며 조회하면
+  // 시작일이 이전 값에 머물러 "기간 설정 실패"가 연달아 났다). 그래서 새 시작일이 현재 종료일보다 뒤면 종료일부터 바꾼다.
+  const curTo = await readValue(frame, ID.dateTo);
+  const endFirst = !!curTo && fmt(fromYmd) > curTo;
   await frame.click(sel('wq_uuid_157_btnCal'), { timeout: 15000 });
   await page.waitForTimeout(2000);
-  for (const [which, ymd] of [['calStart', fromYmd], ['calEnd', toYmd]]) {
+  const order = endFirst ? [['calEnd', toYmd], ['calStart', fromYmd]] : [['calStart', fromYmd], ['calEnd', toYmd]];
+  for (const [which, ymd] of order) {
     const y = String(Number(ymd.slice(0, 4)));
     const m = String(Number(ymd.slice(4, 6)));
     const day = String(Number(ymd.slice(6, 8)));
@@ -135,6 +140,20 @@ async function downloadCsv(page) {
   return out;
 }
 
+// 내보낸 파일의 머리말에는 "검색조건 : 프롬프트 N: 기준일자(From) / 기준일자(To)"로 보고서가 실제로 실행된 기간이 그대로 적혀 있다(실측).
+// 이걸 요청한 기간과 대조하면 이전 조회 결과를 내보냈는지(화면이 아직 안 바뀐 채 내보낸 경우)를 원인과 상관없이 잡아낼 수 있다.
+const csvText = (file) => {
+  const buf = fs.readFileSync(file);
+  return (buf[0] === 0xFF && buf[1] === 0xFE) ? buf.toString('utf16le') : buf.toString('utf8');
+};
+function csvPromptDates(file) {
+  const text = csvText(file);
+  const f = text.match(/기준일자\(From\)\s*\r?\n\s*(\d{8})/), t = text.match(/기준일자\(To\)\s*\r?\n\s*(\d{8})/);
+  return f && t ? { from: f[1], to: t[1] } : null;
+}
+// 결과가 정말 0건인 내보내기: 데이터 머리줄이 없고 "이 보기에 대한 데이터가 복귀되지 않았습니다" 문구가 있다(기간 일치는 위에서 따로 확인한다).
+const csvIsEmpty = (file) => { const text = csvText(file); return !text.includes('세부품명번호') && text.includes('이 보기에 대한 데이터가 복귀되지 않았습니다'); };
+
 // 받은 파일을 파싱한다. 실측 결과 이 내보내기는 이름만 .csv 이고 실제로는
 // UTF-16LE + 탭 구분이며, 앞쪽 45줄쯤이 "검색조건 : 프롬프트 N: ..." 머리말이다.
 function parseCsvFile(file) {
@@ -176,6 +195,7 @@ function parseCsvFile(file) {
 // NEW_ROWS_FILE 환경변수가 있으면(서버가 자식 프로세스로 띄울 때) 신규 목록을 그 파일에도 쓴다 —
 // 서버는 stdout이 아니라 그 파일을 읽어서 알림 본문(품목명·기관명 등)을 구성한다.
 // DB_PATH 환경변수로 대상 지정 가능(기본: 프로젝트의 data.db).
+const allNewRows = []; // 구간별로 나눠 저장해도(아래 saveToDb가 여러 번 불린다) 이 실행의 신규 목록은 하나로 모아서 넘긴다
 function saveToDb(rows) {
   let Database;
   try { Database = require('better-sqlite3'); } catch { console.log('   [DB] better-sqlite3 없음 — 건너뜀'); return []; }
@@ -207,8 +227,9 @@ function saveToDb(rows) {
   console.log(`   [DB] hub_items 저장 ${rows.length}건(신규 ${newRows.length}건) → ${dbPath}`);
   db.close();
 
+  allNewRows.push(...newRows);
   if (process.env.NEW_ROWS_FILE) {
-    fs.writeFileSync(process.env.NEW_ROWS_FILE, JSON.stringify(newRows));
+    fs.writeFileSync(process.env.NEW_ROWS_FILE, JSON.stringify(allNewRows));
   }
   return newRows;
 }
@@ -312,6 +333,21 @@ function monthChunks(from, to) {
   return out;
 }
 
+// 허브는 조회 기간을 최대 12개월로 제한한다("계약[납품요구]일자는 최대 12개월까지 조회 가능합니다" 경고창). 그보다 긴 기간은 한 번에
+// 조회하면 거절되므로 12개월 이하 구간으로 자른다(예: 2024-01-01~2026-10-18 → 2024년 / 2025년 / 2026-01-01~10-18).
+function yearWindows(from, to) {
+  const out = [];
+  let cur = from;
+  while (cur <= to) {
+    const d = toDate(cur);
+    const end = addDays(toYmd(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 12, d.getUTCDate()))), -1); // 12개월 뒤 같은 날의 전날
+    const e = end > to ? to : end;
+    out.push([cur, e]);
+    cur = addDays(e, 1);
+  }
+  return out;
+}
+
 // 결과 프레임에서 헤더행을 찾아 행 객체 배열로 바꾼다
 async function extractRows(scope) {
   const parsed = await scope.evaluate(() => {
@@ -332,29 +368,39 @@ async function extractRows(scope) {
 
 // 한 구간을 조회한다. 기간 설정이 어긋나면 조용히 넘어가지 않고 예외를 던진다.
 async function searchRange(page, form, dFrom, dTo) {
-  await setCalendarRange(page, form, dFrom, dTo);
-  const gotFrom = await readValue(form, ID.dateFrom);
-  const gotTo = await readValue(form, ID.dateTo);
-  if (gotFrom !== fmt(dFrom) || gotTo !== fmt(dTo)) {
-    throw new Error(`기간 설정 실패 (요청 ${fmt(dFrom)}~${fmt(dTo)}, 실제 ${gotFrom}~${gotTo})`);
+  // 위젯이 한 번에 안 받는 경우가 있어(실측) 읽어 보고 어긋나면 최대 3번까지 다시 맞춘다. 끝내 어긋나면 예외 — 엉뚱한 기간을 긁지 않는다.
+  for (let attempt = 1; ; attempt++) {
+    await setCalendarRange(page, form, dFrom, dTo);
+    const gotFrom = await readValue(form, ID.dateFrom);
+    const gotTo = await readValue(form, ID.dateTo);
+    if (gotFrom === fmt(dFrom) && gotTo === fmt(dTo)) break;
+    const msg = `기간 설정 실패 (요청 ${fmt(dFrom)}~${fmt(dTo)}, 실제 ${gotFrom}~${gotTo})`;
+    if (attempt >= 3) throw new Error(msg);
+    log(`   [재시도 ${attempt}/3] ${msg}`);
   }
   // 기본 대기(30초)를 그대로 두면 이 요소가 없는 화면에서 30초가 통째로 사라진다(실측: 운영에서 매번 30.0초).
   const sizeErr = await form.selectOption(sel(ID.pageSize), '100', { timeout: 2000 }).then(() => null, (e) => e.message.split('\n')[0]);
   if (sizeErr) log(`   [페이지 크기] 설정 못 함(무시): ${sizeErr.slice(0, 90)}`);
+  // 같은 화면에서 두 번째로 조회하면 이전 결과 표가 새 결과가 뜰 때까지 그대로 남아 있다(실측). 그걸 "다 떴다"로 오인하면 이전 보고서를
+  // 읽거나 내보내게 되므로, 조회 전 표의 지문을 기억해 두었다가 지문이 바뀐 뒤에만 진행한다.
+  const rowsSig = (rows) => (rows.length ? `${rows.length}|${rows[0]['계약(납품요구)번호']}|${rows[rows.length - 1]['계약(납품요구)번호']}` : '');
+  const mstrNow = () => page.frames().find((x) => x.name() === 'mstrFrame' && x.url() !== 'about:blank');
+  const before = mstrNow();
+  const prevSig = before ? rowsSig(await extractRows(before).catch(() => [])) : '';
   await form.click(sel(ID.searchBtn), { timeout: 20000 });
 
-  // 고정 13초(3초 + 10초) 대신 결과표가 나타나 안정되면 바로 넘어간다. 결과가 없거나 늦으면 예전과 같은 13초까지 기다린다.
+  // 고정 13초(3초 + 10초) 대신 새 결과표가 나타나 안정되면 바로 넘어간다. 결과가 없거나 늦으면 예전과 같은 13초까지 기다린다.
   // 검증 경고창은 예전처럼 3초가 지난 뒤부터 확인한다(그 전에는 로딩 중 화면과 헷갈릴 수 있다).
   const t0 = Date.now();
-  let warned = null, dialogChecked = false, lastCount = -1;
+  let warned = null, dialogChecked = false, lastSig = '';
   await waitUntil(page, async () => {
     // 경고창 확인은 예전처럼 딱 한 번만 한다(반복하면 로딩 중 화면의 문구를 경고로 오인할 수 있다)
     if (!dialogChecked && Date.now() - t0 >= 3000) { dialogChecked = true; warned = await dismissDialog(page, form); if (warned) return true; }
-    const f = page.frames().find((x) => x.name() === 'mstrFrame' && x.url() !== 'about:blank');
+    const f = mstrNow();
     if (!f) return false;
-    const n = (await extractRows(f)).length;
-    const stable = n > 0 && n === lastCount; // 표가 아직 그려지는 중이면 행 수가 계속 늘어난다
-    lastCount = n;
+    const sig = rowsSig(await extractRows(f));
+    const stable = sig !== '' && sig === lastSig && sig !== prevSig; // 새 표가 떴고(이전과 다름) 두 번 연속 같아야 한다(그려지는 중이면 계속 바뀐다)
+    lastSig = sig;
     return stable;
   }, 13000, 400);
   if (!dialogChecked) warned = await dismissDialog(page, form); // 결과가 3초 전에 떠서 위에서 못 한 경우
@@ -366,7 +412,25 @@ async function searchRange(page, form, dFrom, dTo) {
     if (mstr) break;
     await page.waitForTimeout(4000);
   }
-  return mstr ? extractRows(mstr) : [];
+  // 결과 화면 자체가 안 떴으면 "결과 0건"이 아니라 실패다 — 0건으로 넘기면 안 긁은 기간이 긁은 것으로 기록된다
+  if (!mstr) throw new Error('결과 화면을 찾지 못함');
+  return extractRows(mstr);
+}
+
+// 한 구간을 조회해서 CSV로 내보낸다. 내보낸 파일의 기간이 요청과 같을 때만 돌려준다 — 보고서가 아직 안 바뀐 채 이전 결과가 나올 수 있어서
+// (실측: 구간을 연달아 조회하면 한 번씩 밀린 결과를 받았다) 다르면 잠시 뒤 다시 받아 보고, 끝내 다르면 예외를 던져 호출한 쪽이 다른 방법을 쓰게 한다.
+async function exportWindowCsv(page, form, wFrom, wTo) {
+  await searchRange(page, form, wFrom, wTo);
+  await shot(page, '5-result');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const file = await downloadCsv(page);
+    const d = csvPromptDates(file);
+    if (!d) { log('   [경고] CSV 머리말에서 기간을 못 읽음 — 기간 확인 없이 진행'); return file; }
+    if (d.from === wFrom && d.to === wTo) return file;
+    log(`   [CSV 기간 불일치 ${attempt}/3] 요청 ${wFrom}~${wTo}, 파일 ${d.from}~${d.to} — 잠시 뒤 다시 받음`);
+    await page.waitForTimeout(5000);
+  }
+  throw new Error('내보낸 CSV의 기간이 계속 요청과 다름');
 }
 
 // 구간을 조회하되 100건(페이지 상한)이 꽉 차면 절반으로 쪼개 재귀 조회한다.
@@ -471,49 +535,72 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
   log('   선택됨 →', await readValue(form, ID.itemInput));
   await shot(page, '3c-picked');
 
-  // CSV 내보내기는 전체 결과를 담으므로 먼저 시도하고, 안 되면 기간을 쪼개 화면을 긁는다.
-  log('\n4. 전체 기간 조회 후 CSV 내보내기 시도...');
-  let collected = [];
-  let viaCsv = false;
-  try {
-    await searchRange(page, form, dFrom, dTo);
-    await shot(page, '5-result');
-    const csv = parseCsvFile(await downloadCsv(page));
-    if (csv && csv.rows.length) {
-      collected = csv.rows;
-      viaCsv = true;
-      log(`   [CSV] 컬럼 ${csv.header.length}개 / ${collected.length}건`);
-    } else {
-      log('   [CSV] 파일에서 헤더를 못 찾음 — 기간 분할로 대체');
-    }
-  } catch (e) {
-    log('   [CSV] 실패:', e.message.split('\n')[0]);
-  }
-
-  if (!viaCsv) {
-    log('\n4-2. 기간을 나눠 화면 조회...');
-    // 화면 표는 한 번에 100건까지만 읽히므로 월 단위로 자르고, 그래도 꽉 차면 더 쪼갠다.
-    const chunks = (from && to) ? monthChunks(dFrom, dTo) : [[dFrom, dTo]];
-    log(`   구간 ${chunks.length}개`);
-    for (const [cFrom, cTo] of chunks) {
-      try {
-        collected.push(...await collectRange(page, form, cFrom, cTo));
-      } catch (e) {
-        log(`   [실패] ${cFrom}~${cTo}: ${e.message.split('\n')[0]}`);
-      }
-    }
-    await shot(page, '5-result');
-  }
-
-  // 같은 라인아이템이 구간 경계나 중복 렌더링으로 겹칠 수 있어 키로 중복 제거
+  // 허브는 조회 기간을 최대 12개월로 제한하므로 그 안에서 구간을 자르고, 구간마다 CSV 내보내기(전체 결과를 준다)를 먼저 시도한다.
+  // CSV가 안 되면 그 구간만 월 단위 화면 조회로 대체한다. 구간이 끝날 때마다 저장하고 "확실히 다 긁은 구간"을 COVERED_FILE에 적는다 —
+  // 서버가 그 구간만 "긁었다"고 기록하게(중간에 멈추거나 일부가 실패해도 성공한 만큼은 남고, 실패한 구간은 다음 조회 때 다시 시도된다).
+  const windows = yearWindows(dFrom, dTo);
+  const covered = [], failed = [];
   const seen = new Set();
-  const rows = collected.filter((r) => {
-    const k = [r['계약(납품요구)번호'], r['변경차수'], r['물품순번']].join('|');
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-  log(`\n5. 수집 완료(${viaCsv ? 'CSV' : '화면 분할'}): 원본 ${collected.length}건 → 중복 제거 후 ${rows.length}건`);
+  const everything = [];
+  let usedFallback = false, rawTotal = 0;
+  const writeStatus = () => { if (process.env.COVERED_FILE) fs.writeFileSync(process.env.COVERED_FILE, JSON.stringify({ covered, failed })); };
+
+  for (let w = 0; w < windows.length; w++) {
+    const [wFrom, wTo] = windows[w];
+    log(`\n4. 전체 기간 조회 후 CSV 내보내기 시도...${windows.length > 1 ? ` (구간 ${w + 1}/${windows.length}: ${wFrom}~${wTo})` : ''}`);
+    let got = null; // 이 구간에서 받은 행. null이면 CSV로는 못 받은 것
+    try {
+      const file = await exportWindowCsv(page, form, wFrom, wTo);
+      const csv = parseCsvFile(file);
+      if (csv && csv.rows.length) {
+        got = csv.rows;
+        log(`   [CSV] 컬럼 ${csv.header.length}개 / ${got.length}건`);
+      } else if (csvIsEmpty(file)) {
+        got = [];
+        log('   [CSV] 이 기간은 결과가 0건(내보내기 머리말로 확인)');
+      } else {
+        log('   [CSV] 파일에서 데이터도 "0건" 표시도 못 찾음 — 기간 분할로 대체');
+      }
+    } catch (e) {
+      log('   [CSV] 실패:', e.message.split('\n')[0]);
+    }
+
+    if (got) {
+      covered.push([wFrom, wTo]);
+    } else {
+      usedFallback = true;
+      log('\n4-2. 기간을 나눠 화면 조회...');
+      // 화면 표는 한 번에 100건까지만 읽히므로 월 단위로 자르고, 그래도 꽉 차면 더 쪼갠다.
+      const chunks = monthChunks(wFrom, wTo);
+      log(`   구간 ${chunks.length}개`);
+      got = [];
+      for (const [cFrom, cTo] of chunks) {
+        try {
+          got.push(...await collectRange(page, form, cFrom, cTo));
+          covered.push([cFrom, cTo]);
+        } catch (e) {
+          failed.push([cFrom, cTo]);
+          log(`   [실패] ${cFrom}~${cTo}: ${e.message.split('\n')[0]}`);
+        }
+      }
+      await shot(page, '5-result');
+    }
+
+    // 같은 라인아이템이 구간 경계나 중복 렌더링으로 겹칠 수 있어 키로 중복 제거
+    const fresh = got.filter((r) => {
+      const k = [r['계약(납품요구)번호'], r['변경차수'], r['물품순번']].join('|');
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    rawTotal += got.length;
+    if (windows.length > 1) log(`   [구간 ${w + 1}/${windows.length}] ${wFrom}~${wTo}: ${got.length}건 → 중복 제거 후 ${fresh.length}건`);
+    if (fresh.length) { saveToDb(fresh); everything.push(...fresh); }
+    writeStatus();
+  }
+
+  const rows = everything;
+  log(`\n5. 수집 완료(${usedFallback ? '일부 화면 분할' : 'CSV'}): 원본 ${rawTotal}건 → 중복 제거 후 ${rows.length}건`);
 
   if (!rows.length) {
     log('   결과 없음');
@@ -528,6 +615,12 @@ async function runScrape(browser, code, dFrom, dTo, from, to) {
     fs.writeFileSync('hub-result.csv',
       '﻿' + [header.map(esc).join(','), ...rows.map((r) => header.map((h) => esc(r[h])).join(','))].join('\r\n'));
     log('   저장: hub-result.json / hub-result.csv');
-    saveToDb(rows);
+  }
+
+  // 일부라도 못 긁은 구간이 있으면 정상 종료(0)로 속이지 않는다 — 서버는 0일 때만 요청 기간 전체를 "긁었다"고 기록한다.
+  // (예전에는 실패한 조각이 로그에만 남고 0으로 끝나, 3년 조회가 한 달만 가져오고도 3년 전체가 완료로 기록됐다.)
+  if (failed.length) {
+    log(`\n   [일부 실패] 못 가져온 구간 ${failed.length}개: ${failed.map(([a, b]) => `${a}~${b}`).join(', ')}`);
+    process.exitCode = 3;
   }
 }

@@ -94,21 +94,27 @@ try { db.exec(`ALTER TABLE filters ADD COLUMN item_code TEXT`); } catch (e) { if
 try { db.exec(`ALTER TABLE filters ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
 try { db.exec(`ALTER TABLE push_subscriptions ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`); } catch (e) { if (!/duplicate column/.test(e.message)) throw e; }
 
-// hub_coverage는 이 기능이 생기기 전부터 이미 hub_items에 쌓여 있던 자료를 모른다 — 그대로 두면
-// "조회" 버튼이 이미 가진 자료까지 전부 빠진 걸로 보고 다시 긁으려 든다. 커버리지가 비어 있는
-// 품목은, 이미 저장된 자료의 최소~최대 계약일자 범위를 1회성으로 커버리지에 채워준다.
-{
-  const codes = db.prepare(`
-    SELECT item_code, MIN(contract_date) minD, MAX(contract_date) maxD FROM hub_items
-    WHERE item_code IS NOT NULL AND item_code NOT IN (SELECT DISTINCT item_code FROM hub_coverage)
-    GROUP BY item_code
-  `).all();
-  const ins = db.prepare(`INSERT INTO hub_coverage (item_code, from_date, to_date) VALUES (?, ?, ?)`);
-  for (const c of codes) {
-    if (!c.minD || !c.maxD) continue;
-    ins.run(c.item_code, c.minD, c.maxD);
-    console.log(`[hub] 기존 자료로 커버리지 초기화: ${c.item_code} ${c.minD}~${c.maxD}`);
-  }
+// hub_coverage 보정(2026-10-19): 예전 수집기는 일부 구간이 실패해도 정상 종료(0)해서 서버가 요청 기간 전체를 "긁었다"고 기록했다.
+// 실제로 3년 범위 조회가 3월 한 달만 가져오고도 2024-01-01~2026-10-18 전체가 완료로 기록돼, 다시 조회해도 영영 비어 보였다.
+// 어디가 진짜 긁힌 곳인지 알 수 없으므로 한 번 초기화한다 — 확실한 최근 7일(자동 수집이 매일 다시 긁는 창)만 남기고 지운다. 지운 구간은
+// 다시 조회하면 빠진 만큼만 다시 긁는다(자료는 그대로 있고, 같은 행은 키로 덮어쓰므로 안전하다).
+// 예전에 있던 "저장된 자료의 최소~최대 계약일로 커버리지 채우기"도 같은 이유(중간이 비어도 다 긁은 것으로 기록)로 없앴다.
+if (getSetting('hub_coverage_version') !== '2') {
+  const ymd = (offset) => new Date(Date.now() + 9 * 3600e3 + offset * 86400e3).toISOString().slice(0, 10).replace(/-/g, '');
+  const keepFrom = ymd(-7), keepTo = ymd(-1);
+  let total = 0, kept = 0;
+  db.transaction(() => {
+    const old = db.prepare(`SELECT item_code, from_date, to_date FROM hub_coverage`).all();
+    total = old.length;
+    db.prepare(`DELETE FROM hub_coverage`).run();
+    const ins = db.prepare(`INSERT INTO hub_coverage (item_code, from_date, to_date) VALUES (?, ?, ?)`);
+    for (const r of old) {
+      const a = r.from_date > keepFrom ? r.from_date : keepFrom, b = r.to_date < keepTo ? r.to_date : keepTo;
+      if (a <= b) { ins.run(r.item_code, a, b); kept++; }
+    }
+    setSetting('hub_coverage_version', '2');
+  })();
+  console.log(`[hub] 수집 범위 기록 보정: ${total}건 중 최근 7일(${keepFrom}~${keepTo})과 겹치는 ${kept}건만 남김`);
 }
 
 // 조회용 가벼운 색인 표(hub_idx)와 트리거를 보장한다 — 자세한 이유는 hubquery.js 맨 위 설명 참고
@@ -612,11 +618,14 @@ function killScrapeChild() { killTree(currentChild, 'SIGKILL'); }
 function runHubScrape(code, fromDate, toDate, onStep) {
   return new Promise((resolve) => {
     const newRowsFile = path.join(path.dirname(DB_PATH), `hub-new-${code}-${process.pid}.json`);
+    // 수집기가 구간별로 "확실히 다 긁은 구간"을 적어 준다 — 일부가 실패해도(종료 코드 0이 아님) 성공한 구간만 기록하려고 쓴다
+    const coveredFile = path.join(path.dirname(DB_PATH), `hub-covered-${code}-${process.pid}.json`);
+    for (const f of [newRowsFile, coveredFile]) { try { fs.unlinkSync(f); } catch (e) { /* 없음 */ } } // 이전 실행이 남긴 파일을 이번 결과로 착각하지 않게
     const args = [SCRAPE_SCRIPT, code];
     if (fromDate && toDate) args.push(fromDate, toDate);
     const child = spawn(process.execPath, args, {
       cwd: __dirname,
-      env: { ...process.env, HUB_SHOTS: '0', NEW_ROWS_FILE: newRowsFile }, // 서버에선 스크린샷 생략
+      env: { ...process.env, HUB_SHOTS: '0', NEW_ROWS_FILE: newRowsFile, COVERED_FILE: coveredFile }, // 서버에선 스크린샷 생략
       detached: process.platform !== 'win32', // 새 프로세스 그룹 — killTree가 크로미움까지 정리할 수 있게
     });
     currentChild = child;
@@ -660,7 +669,15 @@ function runHubScrape(code, fromDate, toDate, onStep) {
           fs.unlinkSync(newRowsFile);
         }
       } catch (e) { console.error('[hub] 신규 항목 파일 읽기 실패:', e.message); }
-      resolve({ exitCode: timedOut ? 124 : (exitCode ?? -1), count: m ? Number(m[1]) : null, newRows, tail, timedOut });
+      let covered = [];
+      try {
+        if (fs.existsSync(coveredFile)) {
+          const c = JSON.parse(fs.readFileSync(coveredFile, 'utf8')).covered;
+          covered = (Array.isArray(c) ? c : []).filter((p) => Array.isArray(p) && /^\d{8}$/.test(p[0]) && /^\d{8}$/.test(p[1]) && p[0] <= p[1]);
+          fs.unlinkSync(coveredFile);
+        }
+      } catch (e) { console.error('[hub] 완료 구간 파일 읽기 실패:', e.message); }
+      resolve({ exitCode: timedOut ? 124 : (exitCode ?? -1), count: m ? Number(m[1]) : null, newRows, covered, tail, timedOut });
     });
   });
 }
@@ -855,8 +872,15 @@ async function scrapeItems(job, items, batch, onSuccess) {
       job.progress = `${i + 1}/${items.length} ${code} — ${label}`; job.percent = stepPercent(i, items.length, step);
     });
     results.push({ code, ...r });
-    if (r.exitCode !== 0) console.error(`[hub] ${code} 실패(종료 코드 ${r.exitCode}${r.timedOut ? ', 시간 초과' : ''}):\n${(r.tail || '').slice(-600)}`);
-    else { mergeCoverage(code, from, to); batch.add(code, r.newRows); if (onSuccess) onSuccess(code); }
+    // 일부 구간만 성공했어도 이미 저장된 신규는 알린다(수집기가 구간별로 저장한다)
+    batch.add(code, r.newRows);
+    if (r.exitCode === 0) { mergeCoverage(code, from, to); if (onSuccess) onSuccess(code); }
+    else {
+      // 정상 종료(0)가 아니면 요청 기간 전체를 "긁었다"고 기록하지 않는다. 수집기가 알려 준 "확실히 다 긁은 구간"만 기록하고,
+      // 나머지는 비워 둬서 다음 조회 때 다시 시도되게 한다(예전에는 실패한 조각이 있어도 0으로 끝나 3년 전체가 완료로 기록됐다).
+      for (const [a, b] of r.covered || []) mergeCoverage(code, a, b);
+      console.error(`[hub] ${code} 실패(종료 코드 ${r.exitCode}${r.timedOut ? ', 시간 초과' : ''}${(r.covered || []).length ? `, 그래도 ${r.covered.length}개 구간은 완료로 기록` : ''}):\n${(r.tail || '').slice(-600)}`);
+    }
   }
   await fillNewNames();
   return results;
@@ -912,8 +936,11 @@ async function manualJobRun(job, requested, quietUserId = null) {
   job.progress = '알림 확인 중...';
   await batch.flush();
   const failed = results.filter((r) => r.exitCode !== 0).length;
+  const savedSome = results.some((r) => r.exitCode !== 0 && ((r.covered || []).length || (r.newRows || []).length)); // 실패했지만 일부는 가져온 경우
   job.progress = failed ? `조회 완료(${failed}건은 수집에 실패했어요)` : '조회 완료';
-  if (failed === results.length) throw new Error('조달데이터허브에서 자료를 가져오지 못했어요. 잠시 뒤에 다시 시도해 주세요.');
+  if (failed === results.length && !savedSome) throw new Error('조달데이터허브에서 자료를 가져오지 못했어요. 잠시 뒤에 다시 시도해 주세요.');
+  // 일부만 실패했으면 화면이 표를 새로 고치면서 이 문구도 보여 준다(작업은 "완료"로 끝난다)
+  if (failed) job.error = savedSome ? '일부 기간은 가져오지 못했어요. 가져온 만큼은 저장했고, 다시 조회하면 빠진 기간만 다시 시도해요.' : '일부 품목은 가져오지 못했어요. 다시 조회하면 빠진 부분만 다시 시도해요.';
 }
 
 // 품목을 추가한 직후 그 품목의 자료를 미리 수집해 둔다. 기간은 조회 화면의 기본값(한 달 전~어제)과 같고, 이미 긁어 둔 구간은
