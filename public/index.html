@@ -37,6 +37,8 @@
   --shadow-sm:0 1px 2px 0 rgb(0 0 0 / .05); --shadow:0 1px 3px 0 rgb(0 0 0 / .1), 0 1px 2px -1px rgb(0 0 0 / .1);
   --success:#16a34a; --success-bg:#f0fdf4; --success-border:#bbf7d0;
   --warn:#dc2626; --warn-bg:#fef2f2; --warn-border:#fecaca;
+  --inno:#6d28d9; --inno-bg:#f5f3ff; --inno-border:#ddd6fe;  /* 혁신제품 배지 */
+  --exc:#b45309; --exc-bg:#fffbeb; --exc-border:#fde68a;     /* 우수제품 배지 */
 }
 *{box-sizing:border-box;margin:0;font-family:'Inter','Malgun Gothic','맑은 고딕','Segoe UI',sans-serif}
 body{background:var(--muted);color:var(--foreground);min-height:100vh}
@@ -127,6 +129,10 @@ table.fixed tbody td{max-width:none}
 tbody td{padding:10px 6px;border:none;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 tbody tr:hover{background:var(--muted)}
 td.num{text-align:right;color:var(--foreground);font-variant-numeric:tabular-nums}
+/* 품목명 앞의 혁신제품·우수제품 배지. 색만으로 구분하지 않도록 글자("혁신"/"우수")를 넣는다 */
+.mk{display:inline-block;font-size:10px;font-weight:600;line-height:1.5;padding:0 6px;margin-right:4px;border:1px solid;border-radius:999px;vertical-align:1px}
+.mk-inno{color:var(--inno);background:var(--inno-bg);border-color:var(--inno-border)}
+.mk-exc{color:var(--exc);background:var(--exc-bg);border-color:var(--exc-border)}
 td.center{text-align:center}
 .table-scroll{overflow-x:auto}
 pre{background:var(--muted);border:1px solid var(--border);border-radius:calc(var(--radius) - 2px);padding:10px;font-size:11px;overflow:auto;max-height:260px;white-space:pre-wrap}
@@ -324,6 +330,7 @@ html.authed #main-view{display:block}
         </div>
       </div>
       <div id="col-chips" class="filter-tags" style="display:none;margin-bottom:8px;align-items:center"></div>
+      <div class="sub" id="mk-legend" style="display:none;margin-bottom:8px"><span class="mk mk-inno">혁신</span>혁신제품 · <span class="mk mk-exc">우수</span>우수제품 — 같은 제품이 그렇게 계약된 기록이 있으면 그 제품의 모든 행에 붙어요</div>
       <div class="table-scroll">
         <table>
           <thead><tr id="contract-thead"></tr></thead>
@@ -692,8 +699,10 @@ function renderContractTabs() {
 }
 
 const escHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const cellHtml = (text, cls) =>
-  `<td${cls ? ' class="' + cls + '"' : ''} title="${escHtml(text)}">${escHtml(text)}</td>`;
+// marks: 서버가 계산한 혁신제품(1)·우수제품(2) 표시 비트. 품목명 칸에만 넘긴다.
+const markBadges = (marks) => ((marks & 1) ? '<span class="mk mk-inno" title="혁신제품">혁신</span>' : '') + ((marks & 2) ? '<span class="mk mk-exc" title="우수제품">우수</span>' : '');
+const cellHtml = (text, cls, marks = 0) =>
+  `<td${cls ? ' class="' + cls + '"' : ''} title="${escHtml(text)}">${markBadges(marks)}${escHtml(text)}</td>`;
 const isNumCol = (name) => /단가|수량|금액/.test(name);
 
 // 컬럼 순서: 머리글을 끌어서 바꾸고, 이 기기(브라우저)에 저장한다. 저장된 순서에 없는 컬럼이
@@ -1133,6 +1142,7 @@ function renderTable(data) {
   excelBtn.style.display = total ? '' : 'none';
   excelBtn.textContent = `엑셀 저장 (${total.toLocaleString()}건)`;
   empty.style.display = rows.length ? 'none' : 'block';
+  document.getElementById('mk-legend').style.display = colOrder.includes('품목명') && rows.some((r) => r['제품표시'] | 0) ? '' : 'none';
   if (total) {
     pill.style.display = ''; pill.className = 'pill ok'; pill.textContent = '단가·수량 포함';
     note.style.display = ''; note.textContent = `조달데이터허브 자료 ${total}건`;
@@ -1142,7 +1152,7 @@ function renderTable(data) {
   }
   for (const h of rows) {
     const tr = document.createElement('tr');
-    tr.innerHTML = colOrder.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''))).join('');
+    tr.innerHTML = colOrder.map((c) => cellHtml(h[c], isNumCol(c) ? 'num' : (c === '조달방식' || c === '업무구분' ? 'center' : ''), c === '품목명' ? h['제품표시'] | 0 : 0)).join('');
     tbody.appendChild(tr);
   }
 

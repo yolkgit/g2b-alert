@@ -4,7 +4,7 @@
 'use strict';
 const { parentPort, workerData } = require('worker_threads');
 const Database = require('better-sqlite3');
-const { exportRows } = require('./hubquery');
+const { exportRows, exportCell } = require('./hubquery');
 const { buildXlsx } = require('./xlsx');
 
 try {
@@ -16,7 +16,7 @@ try {
   db.close();
   const buf = buildXlsx({
     sheetName: label, header,
-    rows: rows.map((j) => header.map((c) => j[c] ?? '')),
+    rows: rows.map((j) => header.map((c) => exportCell(j, c))), // 품목명 앞에 [혁신제품]/[우수제품]을 글자로 붙인다
     numeric: header.map((c) => /단가|수량|금액/.test(c)),
   });
   parentPort.postMessage({ ok: true, buf, count: rows.length });

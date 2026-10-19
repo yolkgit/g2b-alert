@@ -29,7 +29,7 @@ const COLS = {
   '공급금액': { c: 'amount', num: true },
 };
 const SORTABLE_COLS = new Set(Object.keys(COLS));
-const INDEX_VERSION = '5';
+const INDEX_VERSION = '6';
 
 // ─── 지역 ─────────────────────────────────────────────────────────
 // 지역은 수요기관 소재지("경기도 수원시 권선구")에 대해 맞춘다. 원본이 정식 명칭이라 "충남"·"서울시"·
@@ -112,7 +112,22 @@ function cleanItemName(row) {
   if (t && c && (t === c || (t.length >= 2 && c.startsWith(t)) || (t.length >= 3 && c.includes(t)))) rest = comma < 0 ? '' : rest.slice(comma + 1).trimStart();
   return rest || name;
 }
-const toDisplayRow = (rawJson) => { const j = JSON.parse(rawJson); j['품목명'] = cleanItemName(j); return j; };
+// ─── 혁신제품·우수제품 표시 ──────────────────────────────────────────
+// 허브 자료에는 제품 속성이 아니라 "그 계약이 어떤 제도로 체결됐는지"만 있다 — 우수제품여부 = 'Y'(우수조달물품 구매),
+// 조항호내용에 "…에 따른 혁신제품"(혁신제품 수의계약의 법적 근거). 같은 제품도 다른 방식(다수공급자 등)으로 계약되면 이 값이 비어서,
+// 행마다 보면 대부분 놓친다(실측: 우수 39개 제품 중 13개가 일부 행만 표시, 표시가 빠진 행 1,033건). 그래서 같은 제품(물품식별번호)의
+// 어느 행이든 기록이 있으면 그 제품의 모든 행에 붙인다. 비트: 1 = 혁신제품, 2 = 우수제품.
+const MK_INNOVATIVE = 1, MK_EXCELLENT = 2;
+const rowMarks = (j) => (/혁신제품/.test(j['조항호내용'] || '') ? MK_INNOVATIVE : 0) | (j['우수제품여부'] === 'Y' ? MK_EXCELLENT : 0);
+const markPrefix = (mk) => ((mk & MK_INNOVATIVE) ? '[혁신제품]' : '') + ((mk & MK_EXCELLENT) ? '[우수제품]' : '') + (mk ? ' ' : '');
+// 엑셀 한 칸의 값: 품목명 앞에는 표시를 글자로 붙인다(화면의 배지와 같은 정보)
+const exportCell = (j, col) => (col === '품목명' ? markPrefix(j['제품표시'] | 0) : '') + (j[col] ?? '');
+const toDisplayRow = (rawJson, productMk) => {
+  const j = JSON.parse(rawJson);
+  j['품목명'] = cleanItemName(j);
+  j['제품표시'] = rowMarks(j) | ((productMk && productMk.get(j['물품식별번호'])) || 0);
+  return j;
+};
 // 품목명 정렬 키. SQLite에는 한국어 정렬(ICU)이 없어서, 한국어 정렬 규칙("기호 < 숫자 < 한글 < 영문", 대소문자·호환 문자
 // 무시)을 코드 순서(바이트 비교)로 흉내 낼 수 있는 문자열을 미리 만들어 저장해 두고 그걸로 정렬한다.
 //  - NFKC로 호환 문자를 풀고("㎏" → "kg") 소문자로 맞춘다.
@@ -140,7 +155,7 @@ function nameSortKey(name) {
 // 트리거와 초기 채우기가 같은 식을 쓰도록 한 곳에서 만든다.
 const jx = (alias, key) => `COALESCE(json_extract(${alias}.raw_json, '$."${key}"'), '')`;
 const numx = (alias, key) => `CASE WHEN TRIM(${jx(alias, key)}) = '' THEN NULL ELSE CAST(REPLACE(${jx(alias, key)}, ',', '') AS REAL) END`;
-const IDX_COLS = ['id', 'item_code', 'cdate', 'proc', 'kind', 'ctype', 'org', 'loc', 'dname', 'company', 'method', 'unit', 'price', 'qty', 'amount', 'fin'];
+const IDX_COLS = ['id', 'item_code', 'cdate', 'proc', 'kind', 'ctype', 'org', 'loc', 'dname', 'company', 'method', 'unit', 'price', 'qty', 'amount', 'fin', 'pid', 'mk'];
 function idxSelect(alias) {
   return [
     `${alias}.rowid`, `COALESCE(${alias}.item_code, '')`, `COALESCE(${alias}.contract_date, '')`,
@@ -149,6 +164,9 @@ function idxSelect(alias) {
     numx(alias, '계약납품단가'), numx(alias, '계약납품수량'), numx(alias, '공급금액'),
     // 같은 계약이 변경될 때마다 변경차수별 행이 따로 쌓이는데, 공개 통계는 최종 변경분(최종여부가 'N'이 아닌 것)만 센다
     `CASE WHEN json_extract(${alias}.raw_json, '$."최종계약(납품요구)여부"') = 'N' THEN 0 ELSE 1 END`,
+    // 혁신·우수 제품 표시(위 rowMarks와 같은 기준, SQLite 내장 함수만 쓴다) — 제품 단위 전파용으로 제품번호와 함께 저장한다
+    jx(alias, '물품식별번호'),
+    `(CASE WHEN json_extract(${alias}.raw_json, '$."조항호내용"') LIKE '%혁신제품%' THEN ${MK_INNOVATIVE} ELSE 0 END) + (CASE WHEN json_extract(${alias}.raw_json, '$."우수제품여부"') = 'Y' THEN ${MK_EXCELLENT} ELSE 0 END)`,
   ].join(', ');
 }
 
@@ -158,24 +176,27 @@ function ensureHubIndex(db) {
     contract_no TEXT NOT NULL, chg_seq TEXT NOT NULL, item_seq TEXT NOT NULL,
     item_code TEXT, contract_date TEXT, raw_json TEXT NOT NULL, fetched_at TEXT NOT NULL,
     PRIMARY KEY (contract_no, chg_seq, item_seq))`);
+  const ver = (db.prepare(`SELECT value FROM settings WHERE key = 'hub_idx_version'`).get() || {}).value;
+  if (ver !== INDEX_VERSION) {
+    // 정의가 바뀌었으면(열이 늘 수 있어 표째로) 트리거와 색인 표를 지우고 처음부터 다시 만든다. 표를 지우면 그 색인도 같이 지워진다.
+    for (const t of ['trg_hub_idx_ai', 'trg_hub_idx_au', 'trg_hub_idx_ad']) db.exec(`DROP TRIGGER IF EXISTS ${t}`);
+    db.exec('DROP TABLE IF EXISTS hub_idx');
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS hub_idx (
     id INTEGER PRIMARY KEY, item_code TEXT NOT NULL DEFAULT '', cdate TEXT NOT NULL DEFAULT '',
     proc TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '', ctype TEXT NOT NULL DEFAULT '',
     org TEXT NOT NULL DEFAULT '', loc TEXT NOT NULL DEFAULT '', dname TEXT NOT NULL DEFAULT '',
     company TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
-    price REAL, qty REAL, amount REAL, name_clean TEXT, name_sort TEXT, fin INTEGER NOT NULL DEFAULT 1)`);
+    price REAL, qty REAL, amount REAL, name_clean TEXT, name_sort TEXT, fin INTEGER NOT NULL DEFAULT 1,
+    pid TEXT NOT NULL DEFAULT '', mk INTEGER NOT NULL DEFAULT 0)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_hub_idx_code_date ON hub_idx (item_code, cdate)');
+  // 혁신·우수 표시가 있는 행만 담는 작은 부분 색인 — 제품별 표시를 구할 때 전체를 훑지 않는다
+  db.exec('CREATE INDEX IF NOT EXISTS idx_hub_idx_mk ON hub_idx (pid) WHERE mk > 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_hub_idx_names_null ON hub_idx (id) WHERE name_clean IS NULL');
   // 공개 페이지의 품목별 집계(건수·첫/마지막 날짜·세부품명)가 표 본체를 안 읽고 색인만으로 끝나게 하는 전용 색인
   db.exec('CREATE INDEX IF NOT EXISTS idx_hub_idx_public ON hub_idx (item_code, fin, cdate, dname)');
 
   const cols = IDX_COLS.join(', ');
-  const ver = (db.prepare(`SELECT value FROM settings WHERE key = 'hub_idx_version'`).get() || {}).value;
-  if (ver !== INDEX_VERSION) {
-    // 정의가 바뀌었으면 트리거를 새로 만들고 색인 표를 처음부터 다시 채운다
-    for (const t of ['trg_hub_idx_ai', 'trg_hub_idx_au', 'trg_hub_idx_ad']) db.exec(`DROP TRIGGER IF EXISTS ${t}`);
-    db.exec('DELETE FROM hub_idx');
-  }
   // 트리거 안에서 "INSERT OR REPLACE"를 쓰면 안 된다: 트리거를 일으킨 바깥 문장에 충돌 정책이 있으면(수집 스크립트의
   // INSERT … ON CONFLICT DO UPDATE가 그렇다) 안쪽 OR REPLACE가 무시되고 UNIQUE 오류로 그 품목 수집분이 통째로 롤백된다.
   // 그래서 먼저 지우고(DELETE는 충돌 정책과 무관) 그냥 넣는다.
@@ -324,12 +345,25 @@ function cachedCount(db, w, fn) {
 
 // ─── 조회 ─────────────────────────────────────────────────────────
 // clean=true면 화면 표시용으로 품목명을 정리한다. 공개 페이지는 원본 그대로 보여 주려고 false로 부른다.
+// 제품(물품식별번호) → 표시 비트. 표시가 있는 행만 담은 부분 색인을 읽으므로 수천 행이면 1~2ms다. 수집(다른 프로세스)이 DB를 바꾸면
+// data_version이 달라지므로 그때 비우고, 그 밖에도 1분이 지나면 다시 읽는다.
+const marksCache = new Map(); // db 파일 → { dv, at, map }
+function productMarks(db) {
+  const dv = db.pragma('data_version', { simple: true });
+  const c = marksCache.get(db.name);
+  if (c && c.dv === dv && Date.now() - c.at < 60 * 1000) return c.map;
+  const map = new Map();
+  for (const r of db.prepare(`SELECT pid, MAX(mk & ${MK_INNOVATIVE}) a, MAX(mk & ${MK_EXCELLENT}) b FROM hub_idx INDEXED BY idx_hub_idx_mk WHERE mk > 0 AND pid <> '' GROUP BY pid`).all()) map.set(r.pid, r.a | r.b);
+  marksCache.set(db.name, { dv, at: Date.now(), map });
+  return map;
+}
 function fetchRows(db, ids, clean = true) {
   const out = new Array(ids.length);
   const pos = new Map(ids.map((id, i) => [id, i]));
+  const pm = clean ? productMarks(db) : null;
   for (let i = 0; i < ids.length; i += 500) {
     const chunk = ids.slice(i, i + 500);
-    for (const r of db.prepare(`SELECT rowid id, raw_json FROM hub_items WHERE rowid IN (${chunk.map(() => '?').join(',')})`).all(...chunk)) out[pos.get(r.id)] = clean ? toDisplayRow(r.raw_json) : JSON.parse(r.raw_json);
+    for (const r of db.prepare(`SELECT rowid id, raw_json FROM hub_items WHERE rowid IN (${chunk.map(() => '?').join(',')})`).all(...chunk)) out[pos.get(r.id)] = clean ? toDisplayRow(r.raw_json, pm) : JSON.parse(r.raw_json);
   }
   return out.filter(Boolean);
 }
@@ -397,7 +431,7 @@ function publicItemRows(db, code, recentN) {
 
 module.exports = {
   publicItems, publicItemRows,
-  COLS, SORTABLE_COLS, parseRegion, regionSql, regionMatcher, cleanItemName, toDisplayRow,
+  COLS, SORTABLE_COLS, parseRegion, regionSql, regionMatcher, cleanItemName, toDisplayRow, exportCell, markPrefix, rowMarks, productMarks, MK_INNOVATIVE, MK_EXCELLENT,
   ensureHubIndex, fillNames, hasPendingNames, ensureNames, usesNames, scopeFor, parseColFilters, buildWhere, orderClause,
   listRows, exportRows, distinctValues, countsFor, VALUES_MAX,
 };
